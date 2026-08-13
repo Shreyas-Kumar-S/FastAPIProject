@@ -15,7 +15,7 @@ import os
 import datetime
 from fastapiproject.custom_types import RagChunkAndSource,QueryResult,RagSearchResult,RagUpsertResult
 from fastapiproject.data_loader import load_and_chunk_pdf, embed_texts
-from fastapiproject.vector_db import QdrantStorage
+from fastapiproject.vector_db import get_storage
 
 load_dotenv()
 
@@ -69,7 +69,7 @@ async def rag_ingest_pdf(ctx: inngest.Context):
         vecs = embed_texts(chunks)
         ids = [str(uuid.uuid5(uuid.NAMESPACE_URL, f"{sources[i]}:{i}")) for i in range(len(chunks))]
         payloads = [{"source":sources[i],"text": chunks[i]} for i in range(len(chunks))]
-        QdrantStorage().upsert(ids,vecs,payloads)
+        get_storage().upsert(ids,vecs,payloads)
         return RagUpsertResult(ingested=len(chunks))
 
 
@@ -87,7 +87,7 @@ async def rag_ingest_pdf(ctx: inngest.Context):
 async def rag_query_pdf_ai(ctx: inngest.Context):
     def _search(question:str, top_k: int = 5, score_threshold: float = 0.5) -> RagSearchResult:
         query_vec = embed_texts([question])[0]
-        store = QdrantStorage()
+        store = get_storage()
         found = store.search(query_vec, top_k, score_threshold)
         return  RagSearchResult(contexts=found["context"],sources=found["sources"])
 

@@ -131,7 +131,7 @@ branches are cut — see [§18 Questions & Decisions](#18-questions--decisions).
 | F2 | Critical | Correctness | ✅ Verified working (Session 2, user tested against real API with their key) — Gemini model id `gemini-3.6-flash` |
 | F3 | High | Correctness | ✅ Fixed (Session 3) — `embed_texts` result not checked for `None`/length mismatch before upsert |
 | F4 | High | Reliability | ✅ Fixed (Session 3) — `GEMINI_API_KEY` only validated at call time, not startup |
-| F5 | Medium | Performance | `QdrantStorage()` re-created per call; sync client used inside async Inngest steps; `collection_exists` re-checked every construction |
+| F5 | Medium | Performance | ⚠️ Partially fixed (Session 4) — singleton client done; async-client conversion deferred, see D4 |
 | F6 | Medium | Testing | Zero automated tests in the project |
 | F7 | Low | Correctness | Query function's `fn_id="RAG: Query pdf"` and its trigger event `rag/ingest_pdf_ai` are misleading/inconsistent names (ingest vs query) |
 | F8 | Low | UX/Correctness | Empty search results still get sent into the LLM prompt as an empty context block rather than short-circuiting with a "no relevant context" response |
@@ -173,8 +173,10 @@ branches are cut — see [§18 Questions & Decisions](#18-questions--decisions).
 - **WHAT:** `QdrantStorage()` constructed fresh inside every `_upsert`/`_search` call; uses the sync `QdrantClient` inside `async def` Inngest step functions; re-checks `collection_exists` every time.
 - **WHY:** Sync network calls inside an async function block the event loop; recreating the client/collection check adds latency for no benefit.
 - **IMPACT:** Poor throughput under concurrent requests; unnecessary Qdrant round-trips.
-- **SOLUTION:** Share a single client instance (module-level or app-state), move the `collection_exists`/`create_collection` check to a one-time startup step, and evaluate `AsyncQdrantClient`.
-- **VERIFICATION:** Existing search/upsert behavior unchanged; startup performs exactly one collection-existence check per process.
+- **SOLUTION CHOSEN (partial — see D4):** Added a module-level singleton in `vector_db.py`: `get_storage()` lazily constructs one `QdrantStorage` (and therefore runs `collection_exists`/`create_collection` exactly once per process) and returns the same instance on every subsequent call. `main.py`'s `_upsert`/`_search` now call `get_storage()` instead of `QdrantStorage()`. This fixes the "recreated per call" and "repeated collection check" parts of F5.
+  - **Deferred: switching to `AsyncQdrantClient`** (the "blocks the event loop" part). See Decision D4 — confirmed via reading `inngest`'s own source (`step_async.py`) that non-async step handlers are called directly on the event loop, not offloaded to a thread, so the blocking concern is real. Not fixed this session; reasoning and revisit trigger are in D4.
+- **TESTS ADDED:** `tests/test_vector_db.py` (2 cases, mocking the `QdrantStorage` class so no real Qdrant connection is needed): `get_storage()` constructs the class only once across repeated calls; `get_storage()` returns a pre-existing singleton without re-constructing.
+- **VERIFICATION PERFORMED:** `uv run pytest -q` → all passing. Manually confirmed `main.py` still imports cleanly with the `get_storage()` swap. **Could not verify end-to-end against a real Qdrant instance this session** — `localhost:6333` was unreachable (Qdrant not running locally at the time). Flagged here rather than silently skipped, per project rule against claiming unverified things work.
 
 ### F6 — No tests
 - **WHAT / IMPACT / SOLUTION:** No automated tests exist anywhere. Every fix in Step 3 must land with a corresponding test so regressions are caught mechanically, not by re-reading code.
@@ -193,6 +195,7 @@ Documented for awareness; will be addressed opportunistically alongside related 
 | F1 | Session 2, branch `fix/rag-pipeline-hardening` | Added `resolve_safe_pdf_path()` path-containment check before any PDF is read; see full writeup under F1 in §12. |
 | F3 | Session 3, branch `fix/rag-pipeline-hardening` | `embed_texts` now validates embedding count and non-`None` values, raising `RuntimeError` instead of silently misaligning ids/vectors/payloads; see F3 in §12. |
 | F4 | Session 3, branch `fix/rag-pipeline-hardening` | Added FastAPI `lifespan` startup check for `GEMINI_API_KEY`; app now fails fast at boot with a clear message instead of a buried `KeyError` mid-request; see F4 in §12. |
+| F5 (partial) | Session 4, branch `fix/rag-pipeline-hardening` | Added `get_storage()` singleton in `vector_db.py` — one `QdrantClient` and one `collection_exists` check per process instead of per call. Async-client conversion deferred, see D4. |
 
 ## 14. Features Added
 
@@ -207,12 +210,15 @@ Documented for awareness; will be addressed opportunistically alongside related 
 | `tests/test_data_loader.py` | `resolve_safe_pdf_path` (F1 fix) | relative path inside root resolves; `..` traversal outside root rejected (`ValueError`); absolute path outside root rejected (`ValueError`); missing file inside root raises `FileNotFoundError` | 4/4 passed |
 | `tests/test_embed_texts.py` | `embed_texts` (F3 fix), mocked `client.models.embed_content` | correct-length response returns matching vectors; short response raises `RuntimeError`; `None`-valued embedding raises `RuntimeError` | 3/3 passed |
 | `tests/test_main_startup.py` | `lifespan` startup validation (F4 fix), via `TestClient` + `monkeypatch` | app starts with `GEMINI_API_KEY` set; app raises `RuntimeError` at startup when it's unset | 2/2 passed |
+| `tests/test_vector_db.py` | `get_storage()` singleton (F5 fix), mocked `QdrantStorage` class | constructs only once across repeated calls; reuses an existing singleton without re-constructing | 2/2 passed |
 
-**Running total:** `uv run pytest -q` → 9/9 passed (Session 3).
+**Running total:** `uv run pytest -q` → 11/11 passed (Session 4).
 
 **Manual verification (Session 2):** `load_and_chunk_pdf('test.pdf')` re-run against the real sample file with the real Gemini API key loaded — succeeded (1 chunk extracted), confirming F1's fix didn't regress the already-working ingestion path. `load_and_chunk_pdf('../../test.pdf')` confirmed rejected.
 
 **Manual verification (Session 3):** `embed_texts(['hello world', 'second chunk of text'])` re-run against the real Gemini API — returned 2 vectors, dim 3072 each, confirming F3's fix doesn't regress the successful embedding path.
+
+**Manual verification (Session 4):** Confirmed `main.py` still imports cleanly after swapping `QdrantStorage()` calls for `get_storage()`. Could **not** verify end-to-end against a real Qdrant instance — `localhost:6333` was unreachable this session (Qdrant not running). Recommend re-running `_upsert`/`_search` manually once Qdrant is up, before relying on this in a demo.
 
 ## 16. Known Limitations (current, as-is)
 
@@ -244,6 +250,13 @@ Documented for awareness; will be addressed opportunistically alongside related 
 **Decision:** A now; B is still coming later and will reuse the same guard.
 **Reason:** The vulnerable code path (`rag_ingest_pdf` reading `ctx.event.data["pdfs"][i]["pdf_path"]`) is live *today*, independent of whether a Streamlit UI exists yet — it needs to not be exploitable regardless of what future UI calls it. Building the Streamlit upload flow is a Step 5/6-sized task (needs a REST endpoint, file handling, etc.) and out of order per the user's strict workflow. `resolve_safe_pdf_path()` is written so it's exactly the function an upload-endpoint's save step will call too — no throwaway work.
 **Trade-off:** None significant — this is additive; nothing about it needs to change when the Streamlit flow is built later.
+
+### D4 — Defer `AsyncQdrantClient` conversion (F5's remaining scope)
+**Question:** F5 flagged that sync Qdrant calls inside `async def` Inngest step handlers block the event loop. Fix it now by converting to `AsyncQdrantClient` (and making `_upsert`/`_search` async), or defer?
+**Investigation:** Read `inngest`'s own SDK source (`.venv/.../inngest/_internal/step_lib/step_async.py`, `Step.run`): confirmed non-async handlers passed to `ctx.step.run(...)` are called directly (`handler(*handler_args)`) on the running event loop, not offloaded to a thread pool — so the blocking concern in F5 is real, not theoretical.
+**Decision:** Defer the async conversion. Fix only the singleton/one-time-check part of F5 this session.
+**Reason:** The blocking currently has near-zero practical impact — there is no REST API yet (Step 5/6), so nothing sends concurrent user-facing HTTP requests into this process; Inngest itself processes one step at a time in this flow. Converting now means changing `_upsert`/`_search` to `async def`, switching to `AsyncQdrantClient`, and reasoning about how `asyncio.to_thread`/async calls interact with Inngest's step memoization and retry semantics — a nontrivial change for a problem that isn't causing harm yet, and `_load`/`_upsert`/`_search` are slated to move into a proper service layer in Step 5 anyway (F9), which is a more natural place to redesign this.
+**Trade-off:** If Step 6's REST API ends up handling concurrent requests through this same code path before that refactor happens, the blocking becomes real and should be revisited immediately — noted in §24 Remaining Technical Debt as a trigger condition, not just a someday-maybe.
 
 ## 18. Questions & Decisions
 
@@ -302,6 +315,16 @@ main
 - **Tests run:** `uv run pytest -q` → 9/9 passed (full project total).
 - F1, F2, F3, F4 are now all resolved — see §12/§13. Remaining open findings: F5 (Qdrant client lifecycle), F6 (broader test coverage), F7–F9 (low severity, deferred).
 - **Next:** F5 (Qdrant client lifecycle/perf), or proceed to Step 4 (explain current FastAPI implementation) — user's call.
+
+### Session 4 — 2026-08-13
+- User chose F5 next.
+- Read `inngest`'s SDK source directly to check whether `ctx.step.run` offloads sync handlers to a thread — confirmed it does not (`step_async.py`), so F5's "blocks the event loop" concern is real, not theoretical.
+- **Fixed F5 (partial):** added `get_storage()` module-level singleton in `vector_db.py`; `main.py`'s `_upsert`/`_search` now call it instead of constructing `QdrantStorage()` per call. This gives one `QdrantClient` and one `collection_exists` check per process.
+- **Deferred the `AsyncQdrantClient` conversion** — recorded as Decision D4, with an explicit trigger condition (revisit immediately once Step 6's REST API sends concurrent traffic through this code path) rather than an open-ended "later."
+- Added `tests/test_vector_db.py` (2 cases, mocked `QdrantStorage`).
+- **Tests run:** `uv run pytest -q` → 11/11 passed. Manually confirmed `main.py` still imports cleanly.
+- **Could not fully verify:** local Qdrant (`localhost:6333`) was not running this session, so no live end-to-end upsert/search check was possible — noted honestly rather than assumed. Recommend a manual check once Qdrant is running again.
+- **Next:** user's call — remaining low-severity findings (F7–F9), broaden test coverage (F6), or move to Step 4 (explain current FastAPI implementation) ahead of REST API design.
 
 ## 23. Before/After Architecture
 

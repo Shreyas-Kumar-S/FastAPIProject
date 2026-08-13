@@ -36,3 +36,15 @@ class QdrantStorage:
                 sources.append(source)
 
         return {"context":context,"sources":sources}
+
+# Module-level singleton: callers should go through get_storage() instead of
+# constructing QdrantStorage() directly. This means the QdrantClient and the
+# collection_exists/create_collection check run once per process, not once
+# per Inngest step invocation.
+_storage_singleton: QdrantStorage | None = None
+
+def get_storage() -> QdrantStorage:
+    global _storage_singleton
+    if _storage_singleton is None:
+        _storage_singleton = QdrantStorage()
+    return _storage_singleton
