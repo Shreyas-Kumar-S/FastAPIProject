@@ -143,9 +143,71 @@ FastAPI's `Depends()` lets a route declare a reusable "give me X" dependency (e.
 ### 7.7 Response handling, error handling, HTTP status codes — deferred to Step 5/6
 Today these are entirely Inngest's concern, not ours: `inngest.fast_api.serve`'s handler decides what HTTP status/body the `/api/inngest` routes return, per Inngest's own wire protocol — our code never calls `HTTPException`, sets a `status_code`, or shapes an HTTP response directly. There's genuinely nothing to teach here yet using *this* codebase, because we haven't written a route. Step 5 is where this becomes concrete: choosing `200` vs `201` for ingestion, `404`/`422` for a bad query, and where a real `try/except` → `raise HTTPException(...)` pattern will replace "let it bubble up to Inngest's retry logic" (which is correct for the *event-driven* pipeline, but wrong for a synchronous REST endpoint — a REST caller needs an immediate, well-shaped error response, not a retry three minutes later).
 
-## 8. API Documentation
+## 8. API Design (Step 5) — not yet implemented
 
-*(To be completed in Step 6, after endpoints are designed in Step 5 and implemented.)*
+**Status:** Design only. Nothing in this section is built yet — that's Step 6. Once implemented, this section gets a "✅ implemented, see commit X" pass rather than being rewritten from scratch.
+
+**Chosen shape (user decision, Session 6):** mixed model — `/ask` is synchronous (calls the RAG pipeline directly, answers immediately); `/ingest` stays asynchronous via the existing Inngest event (`rag/ingest_pdf`), backed by a new status-polling endpoint. This was a genuine architectural fork with real trade-offs (see the three options offered) — recorded so a future reader understands *why* the two endpoints behave so differently, rather than assuming it's an inconsistency.
+
+### 8.1 What existing functionality becomes API functionality
+
+| Existing logic | Today | New endpoint |
+|---|---|---|
+| `_load` + `_upsert` inside `rag_ingest_pdf` | Only triggerable by sending an `rag/ingest_pdf` Inngest event | `POST /ingest` — sends the same event, adds real file upload instead of requiring a pre-existing server-side path |
+| `_search` inside `rag_query_pdf_ai` | Only triggerable by sending an `rag/ingest_pdf_ai` Inngest event | `POST /ask` — calls the retrieval logic directly, no event involved |
+| Gemini generation + citation parsing inside `rag_query_pdf_ai` | Runs via `ctx.step.ai.infer` (an Inngest-managed durable step) | `POST /ask` gets its **own** direct Gemini call — see Decision D5, this is *not* a shared code path with the Inngest function |
+| (new) Inngest run status | Only visible in the Inngest Dev Server UI | `GET /ingest/{event_id}/status` |
+
+### 8.2 New shared module — `rag_service.py` (resolves F9)
+
+`_load`, `_upsert`, `_search` currently live as closures nested inside the two Inngest function bodies in `main.py` (finding F9). Both the Inngest functions and the new REST endpoints need this logic, so it moves to a new `src/fastapiproject/rag_service.py`:
+
+- `load_and_chunk_sources(pdfs: list[PdfRef]) -> RagChunkAndSource` — today's `_load` body, unchanged logic.
+- `embed_and_upsert(chunks_and_src: RagChunkAndSource) -> RagUpsertResult` — today's `_upsert` body, unchanged logic (already hardened by F3).
+- `search_context(question: str, top_k: int, score_threshold: float) -> RagSearchResult` — today's `_search` body, unchanged logic (already benefits from F5's `get_storage()` singleton).
+- `build_prompt(question: str, contexts: list[str]) -> str` and `parse_cited_answer(raw_answer: str, sources: list[str]) -> tuple[str, list[str]]` — extracted from the inline prompt-building/regex-parsing code currently sitting directly in `rag_query_pdf_ai`, so `/ask` doesn't duplicate that logic.
+
+`main.py`'s `rag_ingest_pdf` and `rag_query_pdf_ai` keep their exact current behavior — they just call into `rag_service.py` instead of defining the logic inline. **No behavior change to the working Inngest functions; this is a pure extraction**, consistent with "don't unnecessarily rewrite working code."
+
+### 8.3 Endpoints
+
+#### `POST /ingest`
+- **Consumes:** `multipart/form-data` — `files: list[UploadFile]` (one or more PDFs).
+- **Validation:** at least one file; each file's extension is `.pdf` and content-type is `application/pdf`; each file ≤ 20MB (configurable constant) — closes the "no upload size limits" known limitation. Empty file list or all-invalid-type → `422`. Oversized file → `413`.
+- **Process:**
+  1. For each uploaded file: sanitize the client-supplied filename to just its basename (`Path(file.filename).name`, discarding any directory components — this is the upload-side equivalent of F1's path-traversal defense, since a malicious filename like `../../evil.pdf` must not escape the upload directory either), prefix it with a `uuid4().hex` to avoid collisions, and save it under a new `PDF_UPLOAD_ROOT/uploads/` directory.
+  2. Re-validate the saved path through F1's existing `resolve_safe_pdf_path()` before using it — belt-and-suspenders, even though we generated the path ourselves.
+  3. Build the same event payload shape `rag_ingest_pdf` already expects (`{"pdfs": [{"pdf_path": ..., "source_id": <original filename>}, ...]}`) and call `inngest_client.send(...)` — **the Inngest function itself is untouched**; this endpoint is just a new way to trigger the same event.
+- **Response:** `202 Accepted`, body `{"event_id": str, "status_url": str}`.
+- **Errors:** `422` (no files / wrong file type), `413` (file too large), `500` (unexpected failure saving files or sending the event).
+- **New config needed:** `PDF_UPLOAD_ROOT/uploads/` must exist before first use (create at `lifespan` startup, alongside the existing env-var check from F4); this directory holds runtime data and must be added to `.gitignore`, same reasoning as `qdrant_storage/` in the baseline commit.
+
+#### `GET /ingest/{event_id}/status`
+- **Process:** calls Inngest's own REST API — `GET {INNGEST_API_ORIGIN}/v1/events/{event_id}/runs` — confirmed via Inngest's official docs (`events/ListEventRuns`) rather than assumed; returns an array of run objects, each with a `status` field (`Queued` / `Running` / `Completed` / `Failed` / `Cancelled`). The Dev Server (local) doesn't require the `Authorization: Bearer <signing_key>` header that Inngest Cloud does; `inngest_client.api_origin`/`event_api_origin` already hold the configured origin, so no new env var is needed to build the URL.
+- **Response mapping:** `200` with `{"event_id", "status", "ingested": int | None, "error": str | None}` — `ingested` populated from the run's output once `status == "Completed"`; `error` populated from the run's error once `status == "Failed"`.
+- **No-runs-yet case:** treated as `status: "Queued"` with `200`, not `404` — right after `POST /ingest` returns, Inngest may not have created the run yet, and a client polling immediately shouldn't see a spurious 404.
+- **Errors:** `502`/`503` if Inngest's own API is unreachable (distinguishes "your ingestion failed" from "we can't currently check").
+
+#### `POST /ask`
+- **Consumes:** JSON — new request model `AskRequest(question: str, top_k: int = 5, score_threshold: float = 0.5)` in `custom_types.py`.
+- **Validation (via Pydantic, enforced automatically — closes the §7.5 gap for this endpoint):** `question` non-empty (`min_length=1`); `top_k` in `[1, 20]`; `score_threshold` in `[0.0, 1.0]`. A violation returns FastAPI's standard `422` with a field-level error body — no custom error handling needed for this part.
+- **Process:** calls `rag_service.search_context(...)` directly (no Inngest event); if `contexts` comes back empty, **short-circuits** with a clean "no relevant context found" answer instead of sending an empty context block to Gemini — this finally resolves deferred finding **F8**, and it's natural to fix here since this code path is being written fresh anyway (not true of the existing Inngest function, which is left alone). Otherwise builds the prompt via `rag_service.build_prompt(...)` and calls Gemini directly via the plain `google-genai` client (see Decision D5 for why this isn't `ctx.step.ai.infer`), then parses the citation line via `rag_service.parse_cited_answer(...)`.
+- **Response:** `200` with the existing `QueryResult` model (`answers`, `sources`, `num_contexts`) — reused as-is, no new response model needed.
+- **Errors:** `422` (bad request body, automatic); `500` (Gemini call fails); `503` (Qdrant unreachable — `get_storage()`/`QdrantClient` raises a connection error).
+
+### 8.4 Status code summary
+
+| Code | Meaning here |
+|---|---|
+| `200` | `/ask` success; `/ingest/.../status` success (including "still queued") |
+| `202` | `/ingest` accepted, processing async |
+| `413` | Uploaded file exceeds the size limit |
+| `422` | Validation failure (bad request body/files) — FastAPI's default for Pydantic validation errors |
+| `500` | Unexpected server-side failure (Gemini/Inngest send error) |
+| `502`/`503` | A dependency (Inngest API, Qdrant) is unreachable |
+
+### 8.5 Routing organization
+Given the app is about to grow past "everything in `main.py`," endpoints are grouped with FastAPI's `APIRouter` (e.g. `src/fastapiproject/routers.py`: one `APIRouter` for `/ingest`-prefixed routes, one for `/ask`), included into `app` via `app.include_router(...)`. This is the idiomatic way FastAPI apps scale past a handful of routes — a real concept to learn here, not overkill for three endpoints, since it keeps `main.py` focused on Inngest wiring and `routers.py` focused on HTTP concerns.
 
 ## 9. Python Concepts Learned
 
@@ -277,13 +339,13 @@ Documented for awareness; will be addressed opportunistically alongside related 
 
 ## 16. Known Limitations (current, as-is)
 
-- No REST API — only reachable via Inngest events (see §7.3 for exactly how an event reaches this app).
-- No auth/rate limiting.
-- No upload size limits.
+- No REST API yet — designed in §8 (Step 5), not implemented until Step 6.
+- No auth/rate limiting (still true after Step 5's design — not in scope; would be a Step 7+ concern).
+- No upload size limits on the *existing* Inngest-event ingestion path (Step 5's `/ingest` design closes this for the new endpoint specifically — see §8.3).
 - Streamlit dependency declared but unused.
 - README.md is empty.
 - `uv run fastapiproject` console script is broken (F11) — use `uv run uvicorn fastapiproject.main:app --reload` instead.
-- No incoming validation on Inngest event payloads (raw dict access; see §7.5) — will be addressed structurally by Step 5's Pydantic request models.
+- No incoming validation on Inngest event payloads (raw dict access; see §7.5) — still true for the event-driven path; `/ask`'s new `AskRequest` model closes this gap only for requests coming through REST.
 - See §12 for the full findings list.
 
 ## 17. Design Decisions
@@ -315,6 +377,19 @@ Documented for awareness; will be addressed opportunistically alongside related 
 **Reason:** The blocking currently has near-zero practical impact — there is no REST API yet (Step 5/6), so nothing sends concurrent user-facing HTTP requests into this process; Inngest itself processes one step at a time in this flow. Converting now means changing `_upsert`/`_search` to `async def`, switching to `AsyncQdrantClient`, and reasoning about how `asyncio.to_thread`/async calls interact with Inngest's step memoization and retry semantics — a nontrivial change for a problem that isn't causing harm yet, and `_load`/`_upsert`/`_search` are slated to move into a proper service layer in Step 5 anyway (F9), which is a more natural place to redesign this.
 **Trade-off:** If Step 6's REST API ends up handling concurrent requests through this same code path before that refactor happens, the blocking becomes real and should be revisited immediately — noted in §24 Remaining Technical Debt as a trigger condition, not just a someday-maybe.
 
+### D5 — `POST /ask` gets its own Gemini call, not shared with the Inngest function
+**Question:** `rag_query_pdf_ai` generates its answer via `ctx.step.ai.infer(...)` — Inngest's own wrapper that makes the LLM call a durable, retryable, observable step. `/ask` is synchronous and has no Inngest step context to call that from. Share the generation code path anyway, or let it diverge?
+**Options:** (A) Give `/ask` its own direct call to Gemini via the plain `google-genai` client (same client already used for embeddings in `data_loader.py`), duplicating a small amount of "call the model" code. (B) Force `/ask` to go through Inngest too (contradicts the chosen mixed-model design — user already rejected the uniform-async option). (C) Rewrite `rag_query_pdf_ai` to also call Gemini directly, dropping `ctx.step.ai.infer`, so both paths share one implementation.
+**Decision:** A.
+**Reason:** (B) was already ruled out by the API-shape decision. (C) would remove Inngest's retry/observability from the *event-driven* query path for no benefit and violates "don't unnecessarily rewrite working code." (A) keeps both paths working as designed, and everything *except* the actual model call — retrieval (`search_context`), prompt construction (`build_prompt`), citation parsing (`parse_cited_answer`) — is still fully shared via `rag_service.py`. Only the ~5-10 lines that actually invoke Gemini differ.
+**Trade-off:** Two places call Gemini for generation instead of one. Acceptable because the two call sites have genuinely different requirements (durable step vs. synchronous call) — this isn't accidental duplication, it's two different integrations with the same model.
+
+### D6 — `/ingest` takes real file uploads, not a path reference
+**Question:** Should `POST /ingest` accept a JSON body referencing a path that already exists on the server (mirroring today's Inngest event schema exactly), or accept actual uploaded file bytes (`multipart/form-data`)?
+**Decision:** Real file upload (`UploadFile`).
+**Reason:** Follows directly from Decision D3 (Session 2) — the user's stated direction was for `pdf_path` to eventually come from an upload flow, not typed/referenced text. Since Step 5 is a from-scratch design (no existing REST behavior to preserve), there's no reason to design the worse intermediate version first. `resolve_safe_pdf_path` (F1) still does exactly the same job here — validating the path *after* our own code generates it, as defense in depth.
+**Trade-off:** More implementation work in Step 6 (multipart handling, filename sanitization, size limits) than a JSON-body version would need — accepted, since it's the design that's actually useful for a live demo/portfolio piece.
+
 ## 18. Questions & Decisions
 
 Q&A log, chronological:
@@ -322,18 +397,22 @@ Q&A log, chronological:
 1. **Q:** Doc source format (see D1). **A:** Markdown.
 2. **Q:** GitHub repo creation timing (see D2). **A:** Follow workflow order (hold off).
 3. **Q:** F1 fix — which base directory should `pdf_path` be restricted to? **A (user):** "Let the option to upload be coming from the user via the streamlit UI, there we get the path which needs to be filled in" — i.e., long-term the path should come from an upload widget, not typed text. Interpreted as informing the *eventual* design (Step 5/6), while the *immediate* fix (this session) hardens the current Inngest code path with project-root containment — see D3.
+4. **Q:** How should the new REST endpoints relate to the existing Inngest functions — sync, async, or a mix? **A (user):** Mixed: sync `/ask`, async `/ingest` (the recommended option). Drove the entire Step 5 design — see §8 and Decisions D5/D6.
 
 ## 19. Git Branching Strategy
 
-*(To be defined at Step 3 kickoff — planned shape below, subject to change)*
+**Updated Session 6, post-Step-5-design.** `fix/rag-pipeline-hardening` (F1, F3, F4, F5, Step 4 docs) is done but not yet merged to `main` — no GitHub remote exists yet (Decision D2), so it's still a local stack of one branch. Step 6 implementation will stack on top of it, since it depends on all of those fixes (especially F5's `get_storage()` and F1's `resolve_safe_pdf_path`, both reused directly by the new endpoints):
 
 ```
 main
- └── fix/rag-pipeline-hardening        (F1–F5 fixes, stacked or single — TBD by dependency)
-      └── feature/fastapi-foundation   (Step 4/5 groundwork)
-           └── feature/ask-endpoint    (Step 6: first REST endpoint)
-                └── feature/api-tests  (Step 6: endpoint test coverage)
+ └── fix/rag-pipeline-hardening         (done: F1, F3, F4, F5, Step 4 docs — 4 commits)
+      └── feature/rag-service-extraction (Step 6: rag_service.py — F9, no behavior change)
+           └── feature/ask-endpoint      (Step 6: POST /ask, depends on rag_service)
+                └── feature/ingest-endpoint (Step 6: POST /ingest + status, depends on rag_service)
+                     └── feature/api-tests   (Step 6: endpoint test coverage for all three)
 ```
+
+`feature/rag-service-extraction` is the base of the stack (not `feature/fastapi-foundation` as originally sketched in Session 1 — that name predated the actual design; the real first step is the extraction, since both new endpoints and the untouched Inngest functions depend on it).
 
 ## 20. Stacked PR History
 
@@ -390,6 +469,16 @@ main
 - Added FastAPI/RAG concept notes to §10/§11 (ASGI vs WSGI, route registration via a third-party library, `Depends()`, `lifespan` vs per-request DI, Inngest's durable-execution/replay model).
 - No code changes this session — Step 4 is explanation-only, per the workflow.
 - **Next:** Step 5 — design the REST API (endpoints, request/response schemas, validation, status codes) building on §7's findings, before implementing anything.
+
+### Session 6 — 2026-08-13
+- Asked the user to resolve the core architectural fork before designing anything: should new REST endpoints be synchronous, fully async via Inngest, or bypass Inngest entirely? User chose the mixed model (sync `/ask`, async `/ingest`) — recorded in §18 Q4.
+- Checked Inngest's actual Python SDK surface (`inngest.Inngest.send` signature) and confirmed there's no built-in "get run status" method — a status endpoint has to call Inngest's own REST API directly.
+- Looked up Inngest's REST API docs (via Context7, not assumed) for the correct endpoint shape: `GET {origin}/v1/events/{event_id}/runs` (`events/ListEventRuns`), used to design `GET /ingest/{event_id}/status` accurately.
+- Wrote the full Step 5 design into §8: three endpoints (`POST /ingest`, `GET /ingest/{event_id}/status`, `POST /ask`), request/response schemas, validation rules, error responses, status codes, and a new shared `rag_service.py` module (resolves F9 — business logic no longer nested inside Inngest function bodies).
+- Recorded two follow-on design decisions: D5 (`/ask` gets its own direct Gemini call rather than sharing `ctx.step.ai.infer` with the Inngest function — reasoned, not arbitrary duplication) and D6 (`/ingest` takes real file uploads per the earlier D3 direction, not a JSON path reference).
+- Noted `/ask`'s design will finally resolve deferred finding F8 (empty-context short-circuit) since that code path is new anyway.
+- No code changes this session — Step 5 is design-only, per the workflow. §8 is explicitly marked "not yet implemented."
+- **Next:** Step 6 — implement the endpoints incrementally (branch `feature/fastapi-foundation` → `feature/ask-endpoint` → `feature/ingest-endpoint` → `feature/api-tests`, per §19's planned branching), starting with the `rag_service.py` extraction since both new endpoints and the existing Inngest functions depend on it.
 
 ## 23. Before/After Architecture
 
