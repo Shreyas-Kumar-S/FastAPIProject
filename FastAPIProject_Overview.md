@@ -108,6 +108,8 @@ branches are cut — see [§18 Questions & Decisions](#18-questions--decisions).
 ## 9. Python Concepts Learned
 
 - **Session 1:** `uuid.uuid5(namespace, name)` — deterministic (not random) UUIDs: same input always produces the same UUID, which is what makes re-ingestion idempotent instead of creating duplicate vectors.
+- **Session 2 (F1 fix):** Path traversal defense pattern — never trust a caller-supplied path string directly. Join it onto a fixed, trusted base directory, call `.resolve()` (collapses `..` segments and symlinks into a canonical absolute path), then use `Path.is_relative_to(base)` to confirm the result is still inside the allowed directory before touching the filesystem. Checking the *string* for `".."` is not sufficient (e.g. symlinks, encoded separators) — always validate the *resolved* path.
+- **Session 2 (F1 fix):** `pytest` fixtures (`tmp_path`) — pytest gives every test function a fresh, auto-cleaned temporary directory via the built-in `tmp_path` fixture, which is why the traversal tests can create real files without touching the actual project directory or leaving artifacts behind.
 
 ## 10. FastAPI Concepts Learned
 
@@ -122,8 +124,8 @@ branches are cut — see [§18 Questions & Decisions](#18-questions--decisions).
 
 | # | Severity | Area | What |
 |---|---|---|---|
-| F1 | Critical | Security | Unvalidated `pdf_path` from event data |
-| F2 | Critical | Correctness | Unverified Gemini model id `gemini-3.6-flash` |
+| F1 | Critical | Security | ✅ Fixed (Session 2) — Unvalidated `pdf_path` from event data |
+| F2 | Critical | Correctness | ✅ Verified working (Session 2, user tested against real API with their key) — Gemini model id `gemini-3.6-flash` |
 | F3 | High | Correctness | `embed_texts` result not checked for `None`/length mismatch before upsert |
 | F4 | High | Reliability | `GEMINI_API_KEY` only validated at call time, not startup |
 | F5 | Medium | Performance | `QdrantStorage()` re-created per call; sync client used inside async Inngest steps; `collection_exists` re-checked every construction |
@@ -133,19 +135,19 @@ branches are cut — see [§18 Questions & Decisions](#18-questions--decisions).
 | F9 | Low | Maintainability | Business logic (`_load`, `_upsert`, `_search`) is nested inside Inngest function bodies in `main.py` rather than a separate service/module layer |
 | F10 | Info | Git hygiene | Repo has no completed baseline commit (see §4) — must be fixed before branching |
 
-### F1 — Unvalidated `pdf_path`
+### F1 — Unvalidated `pdf_path` — ✅ FIXED (Session 2)
 - **WHAT:** `pdf["pdf_path"]` from event payload is passed directly to `Path()` and read, with no restriction on location.
 - **WHY:** Event payloads are external input (anything that can publish to the Inngest endpoint controls this path).
 - **IMPACT:** Path traversal / arbitrary local file read (e.g. `../../etc/passwd`-style paths) once ingestion is reachable by less-trusted callers (which it will be once wrapped in a REST endpoint in Step 6).
-- **SOLUTION:** Restrict ingestion to a fixed uploads directory; resolve and verify the final path stays inside it before reading.
-- **VERIFICATION:** Unit test asserting a `..`-containing path is rejected; existing valid-path ingestion still works.
+- **SOLUTION CHOSEN:** Added `resolve_safe_pdf_path(path, base_dir=PDF_UPLOAD_ROOT)` in `data_loader.py`. `PDF_UPLOAD_ROOT` defaults to the project root (`Path(__file__).resolve().parents[2]`), overridable via the `PDF_UPLOAD_ROOT` env var. It joins the candidate path onto `base_dir`, resolves it (`Path.resolve()` collapses `..` and symlinks), and rejects it with `ValueError` unless `candidate.is_relative_to(base_dir)`. Also raises `FileNotFoundError` if the resolved path doesn't exist. `load_and_chunk_pdf` now calls this before handing the path to `PDFReader`.
+  - **Design decision (see D3 below):** user's initial preference was for `pdf_path` to eventually come from a Streamlit file-upload widget rather than raw text input. That's the right long-term shape (Step 5/6 concern — an upload endpoint that saves bytes server-side, so there's no attacker-controlled path string at all). This fix hardens the *current* Inngest-event code path today, and `resolve_safe_pdf_path` is exactly the guard that endpoint's save step will reuse — the base-directory-containment check is identical regardless of where the path string originates.
+  - Default base dir = project root (not a narrower `data/pdfs/` folder) specifically so the existing manually-tested flow (`pdf_path="test.pdf"`) keeps working unchanged — no breaking change to already-verified behavior.
+- **TESTS ADDED:** `tests/test_data_loader.py` (4 cases, all passing): relative path inside root resolves; `..`-traversal outside root raises `ValueError`; absolute path outside root raises `ValueError`; missing-but-in-root file raises `FileNotFoundError`.
+- **VERIFICATION PERFORMED:** `uv run pytest -q` → 4 passed. Manually re-ran `load_and_chunk_pdf('test.pdf')` against the real `test.pdf` (with real Gemini API key loaded from `.env`) → succeeded, 1 chunk extracted, confirming the fix doesn't break the previously-working path. Manually confirmed `load_and_chunk_pdf('../../test.pdf')` (escapes project root) is rejected with the expected `ValueError`.
 
-### F2 — Unverified model id
+### F2 — Gemini model id — ✅ VERIFIED WORKING (Session 2)
 - **WHAT:** `model="gemini-3.6-flash"` in `main.py`.
-- **WHY:** Model catalog names change; an invalid id fails at call time, not at startup or review time.
-- **IMPACT:** Query pipeline breaks in production with an opaque API error.
-- **SOLUTION:** Confirm the exact current model id against Gemini docs/API; make it a named constant (mirroring `EMBED_MODEL` in `data_loader.py`) so it's defined once.
-- **VERIFICATION:** Manual query test against the real Gemini API returns a 200/valid completion.
+- **STATUS:** User confirmed they tested this locally against the real Gemini API with their own API key and it works. No code change made — flagged as unverified from static review only; live testing overrides that. Leaving as-is per "if something is already correct, leave it unchanged."
 
 ### F3 — Silent embedding misalignment
 - **WHAT:** `embed_texts` return type is `list[list[float|int] | None]`; `_upsert` and `_search` never check for `None` or length mismatches before zipping with `ids`/`payloads`/`sources`.
@@ -180,7 +182,9 @@ Documented for awareness; will be addressed opportunistically alongside related 
 
 ## 13. Bugs Fixed
 
-*(none yet — Step 3 not started)*
+| # | Fixed in | Summary |
+|---|---|---|
+| F1 | Session 2, branch `fix/rag-pipeline-hardening` | Added `resolve_safe_pdf_path()` path-containment check before any PDF is read; see full writeup under F1 in §12. |
 
 ## 14. Features Added
 
@@ -188,7 +192,13 @@ Documented for awareness; will be addressed opportunistically alongside related 
 
 ## 15. Tests
 
-*(none yet — project currently has zero test files)*
+**Test infra:** `pytest` added as a dev dependency via `uv add --dev pytest` (Session 2). Run with `uv run pytest`.
+
+| File | Covers | Cases | Result |
+|---|---|---|---|
+| `tests/test_data_loader.py` | `resolve_safe_pdf_path` (F1 fix) | relative path inside root resolves; `..` traversal outside root rejected (`ValueError`); absolute path outside root rejected (`ValueError`); missing file inside root raises `FileNotFoundError` | 4/4 passed |
+
+**Manual verification (Session 2):** `load_and_chunk_pdf('test.pdf')` re-run against the real sample file with the real Gemini API key loaded — succeeded (1 chunk extracted), confirming F1's fix didn't regress the already-working ingestion path. `load_and_chunk_pdf('../../test.pdf')` confirmed rejected.
 
 ## 16. Known Limitations (current, as-is)
 
@@ -214,12 +224,20 @@ Documented for awareness; will be addressed opportunistically alongside related 
 **Reason:** Matches explicit instruction to fix existing problems and design/implement the REST API before Step 7 (GitHub).
 **Trade-off:** Baseline commit (F10) still needs to happen locally in git now, independent of when the GitHub *remote* is created — local git history and remote hosting are separate concerns.
 
+### D3 — F1 fix scope: validate now vs. wait for a Streamlit upload flow
+**Question:** Should F1's fix be a base-directory path-containment check on the current Inngest-event code path, or should we first build the Streamlit upload UI the user has in mind (where the path comes from an actual file upload, not free-text)?
+**Options:** (A) Add path-containment validation now, in the existing `data_loader.py`, defaulting to the project root as the allowed base directory. (B) Defer any fix until the Streamlit upload endpoint exists (Step 5/6), since that will change how `pdf_path` is sourced entirely.
+**Decision:** A now; B is still coming later and will reuse the same guard.
+**Reason:** The vulnerable code path (`rag_ingest_pdf` reading `ctx.event.data["pdfs"][i]["pdf_path"]`) is live *today*, independent of whether a Streamlit UI exists yet — it needs to not be exploitable regardless of what future UI calls it. Building the Streamlit upload flow is a Step 5/6-sized task (needs a REST endpoint, file handling, etc.) and out of order per the user's strict workflow. `resolve_safe_pdf_path()` is written so it's exactly the function an upload-endpoint's save step will call too — no throwaway work.
+**Trade-off:** None significant — this is additive; nothing about it needs to change when the Streamlit flow is built later.
+
 ## 18. Questions & Decisions
 
 Q&A log, chronological:
 
 1. **Q:** Doc source format (see D1). **A:** Markdown.
 2. **Q:** GitHub repo creation timing (see D2). **A:** Follow workflow order (hold off).
+3. **Q:** F1 fix — which base directory should `pdf_path` be restricted to? **A (user):** "Let the option to upload be coming from the user via the streamlit UI, there we get the path which needs to be filled in" — i.e., long-term the path should come from an upload widget, not typed text. Interpreted as informing the *eventual* design (Step 5/6), while the *immediate* fix (this session) hardens the current Inngest code path with project-root containment — see D3.
 
 ## 19. Git Branching Strategy
 
@@ -251,7 +269,18 @@ main
 - Confirmed `gh` auth state; decided to defer GitHub repo creation (Decision D2).
 - Completed Step 1 (understand codebase) and Step 2 (prioritized findings, F1–F10) — see §5, §6, §12.
 - Discovered git baseline issue (F10): no completed initial commit exists; three files are staged empty with real content unstaged, several files fully untracked.
-- **Next:** Step 3 — create the git baseline commit, then fix findings in priority order starting with F1/F2, each on its own branch with tests.
+- **Resolved F10:** Added `.idea/` and `qdrant_storage/` (497MB local Qdrant data) to `.gitignore` — neither is source and both were about to be committed accidentally. Added `.gitattributes` (`*.pdf binary`) after noticing `core.autocrlf=true` flagged `test.pdf` for LF→CRLF conversion, which would silently corrupt the binary PDF on a future checkout. Committed the working baseline as `deb5a33` on branch `main` (renamed from `master` — no remote existed yet, zero-risk rename — to match the GitHub default and this doc's branching diagram), authored by `Shreyas-Kumar-S`, no co-author trailer, per explicit request.
+- **Next:** Step 3 — fix findings in priority order starting with F1/F2, each on its own branch with tests.
+
+### Session 2 — 2026-08-13
+- User confirmed F2 (Gemini model id) tested working against the real API with their own key — marked verified, no code change (see F2 in §12).
+- Branched `fix/rag-pipeline-hardening` off `main`.
+- Asked about F1's allowed-base-directory choice (§18 Q3); user's answer pointed at a future Streamlit-upload-driven design — recorded as Decision D3: fix the current Inngest code path now with project-root containment, keep the same guard function for the future upload endpoint.
+- **Fixed F1:** added `resolve_safe_pdf_path()` + `PDF_UPLOAD_ROOT` to `data_loader.py`; `load_and_chunk_pdf` now validates before reading. Full detail in §12 F1, tests in §15.
+- Added `pytest` as a dev dependency (`uv add --dev pytest`); added `tests/test_data_loader.py` (4 cases).
+- **Tests run:** `uv run pytest -q` → 4/4 passed. Manually re-verified `load_and_chunk_pdf('test.pdf')` still succeeds with the real API key, and that a `..`-escaping path is now rejected.
+- **Not yet committed** — working tree changes on `fix/rag-pipeline-hardening` staged for review before commit.
+- **Next:** commit F1's fix, then move to F3 (embedding alignment) or F4 (startup env validation).
 
 ## 23. Before/After Architecture
 
