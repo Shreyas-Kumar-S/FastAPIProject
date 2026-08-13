@@ -1,5 +1,6 @@
 import logging
 import re
+from contextlib import asynccontextmanager
 
 import uvicorn
 from dotenv import load_dotenv
@@ -17,6 +18,22 @@ from fastapiproject.data_loader import load_and_chunk_pdf, embed_texts
 from fastapiproject.vector_db import QdrantStorage
 
 load_dotenv()
+
+REQUIRED_ENV_VARS = ["GEMINI_API_KEY"]
+
+def _validate_required_env_vars() -> None:
+    missing = [name for name in REQUIRED_ENV_VARS if not os.environ.get(name)]
+    if missing:
+        raise RuntimeError(
+            "Missing required environment variable(s): "
+            f"{', '.join(missing)}. Set them in your .env file or the "
+            "process environment before starting the app."
+        )
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    _validate_required_env_vars()
+    yield
 
 inngest_client = inngest.Inngest(
     app_id="rag_app",
@@ -130,6 +147,6 @@ async def rag_query_pdf_ai(ctx: inngest.Context):
         cited_sources = list(dict.fromkeys(found.sources))
 
     return {"answers":answer,"sources": cited_sources, "num_contexts": len(found.contexts)}
-app = FastAPI()
+app = FastAPI(lifespan=lifespan)
 
 inngest.fast_api.serve(app,inngest_client,[rag_ingest_pdf, rag_query_pdf_ai])

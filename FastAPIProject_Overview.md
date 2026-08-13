@@ -110,10 +110,13 @@ branches are cut — see [§18 Questions & Decisions](#18-questions--decisions).
 - **Session 1:** `uuid.uuid5(namespace, name)` — deterministic (not random) UUIDs: same input always produces the same UUID, which is what makes re-ingestion idempotent instead of creating duplicate vectors.
 - **Session 2 (F1 fix):** Path traversal defense pattern — never trust a caller-supplied path string directly. Join it onto a fixed, trusted base directory, call `.resolve()` (collapses `..` segments and symlinks into a canonical absolute path), then use `Path.is_relative_to(base)` to confirm the result is still inside the allowed directory before touching the filesystem. Checking the *string* for `".."` is not sufficient (e.g. symlinks, encoded separators) — always validate the *resolved* path.
 - **Session 2 (F1 fix):** `pytest` fixtures (`tmp_path`) — pytest gives every test function a fresh, auto-cleaned temporary directory via the built-in `tmp_path` fixture, which is why the traversal tests can create real files without touching the actual project directory or leaving artifacts behind.
+- **Session 3 (F3 fix):** Fail fast at the source, not at every call site — the check for mismatched/`None` embeddings lives once inside `embed_texts` rather than being copy-pasted into `_upsert` and `_search`. Any caller either gets a fully-valid result or an exception; there's no third state where partially-bad data flows further downstream. Same principle as F1's `resolve_safe_pdf_path`.
+- **Session 3 (F4 fix):** `unittest.mock.patch.object` — used to replace `client.models.embed_content` (a real network call) with a fake return value for the duration of a `with` block, so tests exercise `embed_texts`'s own logic without hitting the real Gemini API. `pytest`'s `monkeypatch.setenv`/`monkeypatch.delenv` do the same job for environment variables, automatically restoring the original value after each test.
 
 ## 10. FastAPI Concepts Learned
 
-*(populated from Step 4 onward)*
+- **Session 3 (F4 fix):** `lifespan` — the current, non-deprecated way to run startup/shutdown code in FastAPI. An `@asynccontextmanager` function takes `app`, runs setup code, then `yield`s (the app serves requests while "paused" on the yield), and anything after the `yield` would run on shutdown. Wired in via `FastAPI(lifespan=lifespan)`. In this project it's used to validate `GEMINI_API_KEY` exists once, before the app accepts any requests, instead of checking (or failing) inside every request that needs it.
+- **Session 3 (F4 fix):** `fastapi.testclient.TestClient` used as a context manager (`with TestClient(app): ...`) actually runs the app's `lifespan` startup/shutdown events, which is what makes it possible to unit-test startup-time behavior (like our env-var check) without running a real `uvicorn` server.
 
 ## 11. RAG Concepts Learned
 
@@ -126,8 +129,8 @@ branches are cut — see [§18 Questions & Decisions](#18-questions--decisions).
 |---|---|---|---|
 | F1 | Critical | Security | ✅ Fixed (Session 2) — Unvalidated `pdf_path` from event data |
 | F2 | Critical | Correctness | ✅ Verified working (Session 2, user tested against real API with their key) — Gemini model id `gemini-3.6-flash` |
-| F3 | High | Correctness | `embed_texts` result not checked for `None`/length mismatch before upsert |
-| F4 | High | Reliability | `GEMINI_API_KEY` only validated at call time, not startup |
+| F3 | High | Correctness | ✅ Fixed (Session 3) — `embed_texts` result not checked for `None`/length mismatch before upsert |
+| F4 | High | Reliability | ✅ Fixed (Session 3) — `GEMINI_API_KEY` only validated at call time, not startup |
 | F5 | Medium | Performance | `QdrantStorage()` re-created per call; sync client used inside async Inngest steps; `collection_exists` re-checked every construction |
 | F6 | Medium | Testing | Zero automated tests in the project |
 | F7 | Low | Correctness | Query function's `fn_id="RAG: Query pdf"` and its trigger event `rag/ingest_pdf_ai` are misleading/inconsistent names (ingest vs query) |
@@ -149,19 +152,22 @@ branches are cut — see [§18 Questions & Decisions](#18-questions--decisions).
 - **WHAT:** `model="gemini-3.6-flash"` in `main.py`.
 - **STATUS:** User confirmed they tested this locally against the real Gemini API with their own API key and it works. No code change made — flagged as unverified from static review only; live testing overrides that. Leaving as-is per "if something is already correct, leave it unchanged."
 
-### F3 — Silent embedding misalignment
+### F3 — Silent embedding misalignment — ✅ FIXED (Session 3)
 - **WHAT:** `embed_texts` return type is `list[list[float|int] | None]`; `_upsert` and `_search` never check for `None` or length mismatches before zipping with `ids`/`payloads`/`sources`.
 - **WHY:** All downstream code assumes parallel-list alignment (see §11).
 - **IMPACT:** A single failed embedding shifts every subsequent id/payload pairing — wrong text gets attached to wrong vector, corrupting retrieval silently (no exception raised).
-- **SOLUTION:** Validate embedding count/`None`-ness immediately after the Gemini call; raise a clear error rather than proceeding misaligned.
-- **VERIFICATION:** Unit test with a mocked embedder returning a short/`None`-containing list asserts a raised error instead of silent corruption.
+- **SOLUTION CHOSEN:** `embed_texts` in `data_loader.py` now validates immediately after the Gemini call: raises `RuntimeError` if `len(embeddings) != len(texts)` (count mismatch), and `RuntimeError` if any individual embedding's `.values` is `None`. Return type tightened from `list[list[float|int] | None]` to `list[list[float]]` — callers (`_upsert`, `_search` in `main.py`) needed no changes, since they can now trust the invariant holds or an exception already stopped execution before they run. Validating inside `embed_texts` itself (rather than duplicating the check in every caller) keeps the invariant enforced at its single point of origin — same principle as F1's fix.
+- **TESTS ADDED:** `tests/test_embed_texts.py` (3 cases, mocking `client.models.embed_content` so no real API calls are needed): correct-length input returns matching vectors; short embeddings list raises `RuntimeError`; a `None`-valued embedding raises `RuntimeError`.
+- **VERIFICATION PERFORMED:** `uv run pytest -q` → all passing. Manually re-ran `embed_texts(['hello world', 'second chunk of text'])` against the real Gemini API → 2 vectors returned, each dim 3072 (matches `EMBED_DIM`), confirming no regression on the successful path.
 
-### F4 — API key validated too late
+### F4 — API key validated too late — ✅ FIXED (Session 3)
 - **WHAT:** `os.environ["GEMINI_API_KEY"]` is read inside the query function body.
 - **WHY:** Fails on first real request instead of at process startup.
 - **IMPACT:** Confusing runtime `KeyError` deep in a request instead of a clear boot-time failure.
-- **SOLUTION:** Validate required env vars once at startup (e.g. FastAPI startup hook), fail fast with a clear message.
-- **VERIFICATION:** Start app with the var unset → clear startup error, not a buried `KeyError`.
+- **SOLUTION CHOSEN:** Added a FastAPI `lifespan` context manager in `main.py` (`_validate_required_env_vars()` + `@asynccontextmanager async def lifespan(app)`), wired via `FastAPI(lifespan=lifespan)`. It checks `REQUIRED_ENV_VARS = ["GEMINI_API_KEY"]` and raises a clear `RuntimeError` naming the missing variable(s) before the app finishes starting, instead of only failing inside a request handler. `os.environ["GEMINI_API_KEY"]` inside `rag_query_pdf_ai` is left as-is — safe now that startup guarantees the key exists before any request is served.
+  - **Why `lifespan` over a simpler module-level constant check:** `data_loader.py`'s `genai.Client()` already fails at import time if the key is entirely missing (the SDK's own check), so a second guard was arguably redundant for that one variable. `lifespan` was chosen anyway because it's the idiomatic, current FastAPI startup-validation pattern (the deprecated alternative is `@app.on_event("startup")`), it's independently testable via `TestClient`, and it gives a single, extensible place to add more required vars later (e.g. `QDRANT_URL`) without relying on import-order side effects.
+- **TESTS ADDED:** `tests/test_main_startup.py` (2 cases, using `fastapi.testclient.TestClient` + `monkeypatch` on `os.environ`): app starts cleanly when `GEMINI_API_KEY` is set; app raises `RuntimeError` mentioning `GEMINI_API_KEY` when it's unset, at `TestClient` construction time (i.e. at lifespan startup) rather than during a request.
+- **VERIFICATION PERFORMED:** `uv run pytest -q` → all passing (9/9 total across the project at this point).
 
 ### F5 — Qdrant client lifecycle
 - **WHAT:** `QdrantStorage()` constructed fresh inside every `_upsert`/`_search` call; uses the sync `QdrantClient` inside `async def` Inngest step functions; re-checks `collection_exists` every time.
@@ -185,6 +191,8 @@ Documented for awareness; will be addressed opportunistically alongside related 
 | # | Fixed in | Summary |
 |---|---|---|
 | F1 | Session 2, branch `fix/rag-pipeline-hardening` | Added `resolve_safe_pdf_path()` path-containment check before any PDF is read; see full writeup under F1 in §12. |
+| F3 | Session 3, branch `fix/rag-pipeline-hardening` | `embed_texts` now validates embedding count and non-`None` values, raising `RuntimeError` instead of silently misaligning ids/vectors/payloads; see F3 in §12. |
+| F4 | Session 3, branch `fix/rag-pipeline-hardening` | Added FastAPI `lifespan` startup check for `GEMINI_API_KEY`; app now fails fast at boot with a clear message instead of a buried `KeyError` mid-request; see F4 in §12. |
 
 ## 14. Features Added
 
@@ -197,8 +205,14 @@ Documented for awareness; will be addressed opportunistically alongside related 
 | File | Covers | Cases | Result |
 |---|---|---|---|
 | `tests/test_data_loader.py` | `resolve_safe_pdf_path` (F1 fix) | relative path inside root resolves; `..` traversal outside root rejected (`ValueError`); absolute path outside root rejected (`ValueError`); missing file inside root raises `FileNotFoundError` | 4/4 passed |
+| `tests/test_embed_texts.py` | `embed_texts` (F3 fix), mocked `client.models.embed_content` | correct-length response returns matching vectors; short response raises `RuntimeError`; `None`-valued embedding raises `RuntimeError` | 3/3 passed |
+| `tests/test_main_startup.py` | `lifespan` startup validation (F4 fix), via `TestClient` + `monkeypatch` | app starts with `GEMINI_API_KEY` set; app raises `RuntimeError` at startup when it's unset | 2/2 passed |
+
+**Running total:** `uv run pytest -q` → 9/9 passed (Session 3).
 
 **Manual verification (Session 2):** `load_and_chunk_pdf('test.pdf')` re-run against the real sample file with the real Gemini API key loaded — succeeded (1 chunk extracted), confirming F1's fix didn't regress the already-working ingestion path. `load_and_chunk_pdf('../../test.pdf')` confirmed rejected.
+
+**Manual verification (Session 3):** `embed_texts(['hello world', 'second chunk of text'])` re-run against the real Gemini API — returned 2 vectors, dim 3072 each, confirming F3's fix doesn't regress the successful embedding path.
 
 ## 16. Known Limitations (current, as-is)
 
@@ -279,8 +293,15 @@ main
 - **Fixed F1:** added `resolve_safe_pdf_path()` + `PDF_UPLOAD_ROOT` to `data_loader.py`; `load_and_chunk_pdf` now validates before reading. Full detail in §12 F1, tests in §15.
 - Added `pytest` as a dev dependency (`uv add --dev pytest`); added `tests/test_data_loader.py` (4 cases).
 - **Tests run:** `uv run pytest -q` → 4/4 passed. Manually re-verified `load_and_chunk_pdf('test.pdf')` still succeeds with the real API key, and that a `..`-escaping path is now rejected.
-- **Not yet committed** — working tree changes on `fix/rag-pipeline-hardening` staged for review before commit.
-- **Next:** commit F1's fix, then move to F3 (embedding alignment) or F4 (startup env validation).
+- Committed F1's fix as `1a912ff` on `fix/rag-pipeline-hardening`.
+- **Next:** F3 (embedding alignment), then F4 (startup env validation), per user's explicit ordering.
+
+### Session 3 — 2026-08-13
+- **Fixed F3:** `embed_texts` in `data_loader.py` now validates embedding count and non-`None` values, raising `RuntimeError` on mismatch instead of silently misaligning downstream ids/vectors/payloads. Added `tests/test_embed_texts.py` (3 cases, mocked API). `uv run pytest -q` passing; manually re-verified against the real Gemini API (2 inputs → 2 vectors, dim 3072). Committed as `f5d7b6a`.
+- **Fixed F4:** Added a FastAPI `lifespan` context manager in `main.py` that validates `GEMINI_API_KEY` is set before the app finishes starting, failing fast with a clear `RuntimeError` instead of a `KeyError` buried inside a request. Added `tests/test_main_startup.py` (2 cases, using `TestClient` + `monkeypatch`). Full rationale (including why `lifespan` was chosen over a simpler module-level check) is under F4 in §12.
+- **Tests run:** `uv run pytest -q` → 9/9 passed (full project total).
+- F1, F2, F3, F4 are now all resolved — see §12/§13. Remaining open findings: F5 (Qdrant client lifecycle), F6 (broader test coverage), F7–F9 (low severity, deferred).
+- **Next:** F5 (Qdrant client lifecycle/perf), or proceed to Step 4 (explain current FastAPI implementation) — user's call.
 
 ## 23. Before/After Architecture
 
