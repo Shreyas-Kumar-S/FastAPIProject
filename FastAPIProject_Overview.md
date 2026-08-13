@@ -97,9 +97,51 @@ branches are cut — see [§18 Questions & Decisions](#18-questions--decisions).
 4. `ctx.step.ai.infer(...)` calls Gemini (model `gemini-3.6-flash` — **unverified, see finding F2**) through Inngest's AI step wrapper (gives Inngest visibility/retries over the LLM call itself).
 5. Response is regex-parsed to split the prose answer from the `Used: [...]` line; cited indices are mapped back to `found.sources`, deduplicated, and returned as `{"answers", "sources", "num_contexts"}`.
 
-## 7. FastAPI Architecture
+## 7. FastAPI Architecture (Step 4)
 
-*(To be completed in Step 4 — request lifecycle, ASGI, how `inngest.fast_api.serve` wires routes onto the `FastAPI()` app, ASGI vs WSGI, ASGI app object, ⇒ ties directly into the REST API design in Step 5.)*
+### 7.1 The `app` object, ASGI, and Uvicorn
+`app = FastAPI(lifespan=lifespan)` (`main.py`) creates an **ASGI application object**. ASGI (Asynchronous Server Gateway Interface) is the async successor to WSGI — it lets a Python web app handle async I/O, streaming, and (though unused here) websockets. FastAPI is built on Starlette, which implements ASGI; FastAPI adds routing sugar, Pydantic-based validation, and automatic OpenAPI docs on top.
+
+`app` on its own does nothing — it's just an object with a registered set of routes/middleware/lifespan hooks. **Uvicorn is the ASGI server**: a real process that opens a socket, speaks HTTP, and for each incoming request calls into `app` using the ASGI calling convention (`scope`, `receive`, `send`). The standard way to run this project is:
+```
+uv run uvicorn fastapiproject.main:app --reload
+```
+**Finding F11 (new, discovered this session):** `pyproject.toml` declares a console script `fastapiproject = "fastapiproject:main"`, but `src/fastapiproject/__init__.py` is empty — there is no `main` attribute on the package, so running the installed `fastapiproject` command (or `uv run fastapiproject`) fails immediately with an `AttributeError`/import error. It does **not** start the app. Confirmed via `hasattr(fastapiproject, 'main')` → `False`. This is cosmetic (the real launch command above works fine) but misleading for anyone who tries the "obvious" `uv run fastapiproject`. Logged for a future fix, not addressed yet — see §24.
+
+### 7.2 Where the routes actually come from
+This project defines **zero routes directly** (no `@app.get(...)` / `@app.post(...)` anywhere in `main.py`). All routes come from this one line:
+```python
+inngest.fast_api.serve(app, inngest_client, [rag_ingest_pdf, rag_query_pdf_ai])
+```
+Reading `inngest.fast_api.serve`'s source confirms it calls `@app.get(...)`, `@app.post(...)`, and `@app.put(...)` on the `app` object we pass in, all at the same path — `/api/inngest` by default (`inngest._internal.const.DEFAULT_SERVE_PATH`). So after this line runs, `app` has exactly three routes, all owned by the Inngest SDK, not by our own code:
+- `GET /api/inngest` — introspection (lets the Inngest Dev Server/Cloud ask "what functions do you serve?").
+- `PUT /api/inngest` — registration ("sync"): tells Inngest about `rag_ingest_pdf`/`rag_query_pdf_ai` so it knows they exist and what events trigger them.
+- `POST /api/inngest` — invocation: Inngest calls this to actually run a step of one of our functions.
+
+### 7.3 Request lifecycle, end to end
+For the two RAG functions, there is **no direct client → our-app HTTP call**. The actual path is:
+1. Something sends an event (`rag/ingest_pdf` or `rag/ingest_pdf_ai`) to Inngest — e.g. `inngest_client.send(...)` from other code, or the Inngest Dev Server UI. This does **not** hit our FastAPI app at all; it hits Inngest's own event API.
+2. Inngest's orchestrator (running separately — the Dev Server locally, or Inngest Cloud in production) sees a matching trigger and makes an HTTP `POST /api/inngest` call **into our FastAPI app** to execute the function.
+3. Uvicorn accepts the TCP connection, parses the HTTP request into an ASGI `scope`, and calls `app`.
+4. On the very first request after process start, FastAPI runs our `lifespan` context manager (§F4) — `_validate_required_env_vars()` — before any route handler runs. If that raises, the app never starts serving at all.
+5. Starlette's router matches the path (`/api/inngest`) and method (`POST`) to the handler `inngest.fast_api.serve` registered, and calls it.
+6. That handler hands the request to Inngest's `CommHandler`, which figures out *which* function and *which step* this call is for, and calls into our `rag_ingest_pdf`/`rag_query_pdf_ai` code.
+7. **Key detail specific to Inngest ("durable execution"):** one HTTP call ≠ one full function run. Inngest calls `POST /api/inngest` **once per step**. On each call, our function body re-executes from the top, but every `ctx.step.run(...)` whose step already completed returns its previously-saved (memoized) result immediately instead of re-running the lambda — it doesn't repeat the work. The first step that hasn't run yet actually executes; its result is packaged up and the call returns; Inngest saves that result and makes another `POST /api/inngest` call for the next step. This is why `_load`, `_upsert`, `_search` must be deterministic and side-effect-safe to re-run, and why raising a clear exception from inside a step (see F1/F3/F4 fixes) is the correct way to signal failure — Inngest catches it and retries that step, exactly the "durable/retryable" behavior the whole architecture is built around.
+8. Once the function returns its final value, that becomes the *Inngest function's* result (visible in the Inngest Dev Server UI / via its API) — not an HTTP response body a REST client is waiting on. Nothing in this project today lets an external caller wait synchronously for `{"answers": ..., "sources": ...}` over HTTP — that gap is exactly what Step 5/6 (a real `/ask` endpoint) will close.
+
+### 7.4 Pydantic models — current role vs. future role
+`custom_types.py`'s models (`RagChunkAndSource`, `RagUpsertResult`, `RagSearchResult`, `QueryResult`) are **not** used as FastAPI request/response schemas today, because there are no custom routes for them to attach to. Their actual job right now: `output_type=` on `ctx.step.run(...)`, combined with `inngest.PydanticSerializer()` on the client — this tells Inngest how to serialize a step's Python return value to JSON for durable storage, and deserialize it back into a real Pydantic object (with validation) when a memoized result is replayed. That's a genuine, if different, use of Pydantic's validation: it guards the *replay* path, not an incoming HTTP request.
+
+In Step 5/6, these same models (or close variants) become the natural request/response schemas for real endpoints — e.g. a `POST /ask` request body validated against a `QueryRequest(question: str, top_k: int = 5, ...)` model, and `QueryResult` returned directly as the response, with FastAPI auto-generating the OpenAPI schema and rejecting malformed requests with `422` before our code ever runs.
+
+### 7.5 Validation today (a gap, not yet in §12's F-list)
+Because there's no Pydantic model on the *incoming* side, event payloads are read via raw dict access — `ctx.event.data["pdfs"]`, `.get("source_id", pdf_path)`, `ctx.event.data["question"]`. A malformed event (missing `"question"` key, `"pdfs"` not a list, etc.) raises a raw `KeyError`/`TypeError` deep inside the function rather than a clean validation error. This is the direct FastAPI-shaped fix Step 5 provides "for free": a `BaseModel` request schema makes this class of bug structurally impossible for anything going through the new REST endpoint (though the Inngest-event entry point would still need its own explicit validation if kept).
+
+### 7.6 Dependency injection — not used yet
+FastAPI's `Depends()` lets a route declare a reusable "give me X" dependency (e.g. a DB session, the current user) that FastAPI resolves and injects before calling the handler; it can chain (dependencies can themselves have dependencies) and is cached per-request by default. Nothing in this project uses it yet, because there are no hand-written routes. Natural fit for later: `get_storage` (added in the F5 fix, `vector_db.py`) is already shaped exactly like a FastAPI dependency function (no arguments, returns a shared instance) — Step 5/6 can likely reuse it as `store: QdrantStorage = Depends(get_storage)` with zero changes to `get_storage` itself.
+
+### 7.7 Response handling, error handling, HTTP status codes — deferred to Step 5/6
+Today these are entirely Inngest's concern, not ours: `inngest.fast_api.serve`'s handler decides what HTTP status/body the `/api/inngest` routes return, per Inngest's own wire protocol — our code never calls `HTTPException`, sets a `status_code`, or shapes an HTTP response directly. There's genuinely nothing to teach here yet using *this* codebase, because we haven't written a route. Step 5 is where this becomes concrete: choosing `200` vs `201` for ingestion, `404`/`422` for a bad query, and where a real `try/except` → `raise HTTPException(...)` pattern will replace "let it bubble up to Inngest's retry logic" (which is correct for the *event-driven* pipeline, but wrong for a synchronous REST endpoint — a REST caller needs an immediate, well-shaped error response, not a retry three minutes later).
 
 ## 8. API Documentation
 
@@ -117,11 +159,16 @@ branches are cut — see [§18 Questions & Decisions](#18-questions--decisions).
 
 - **Session 3 (F4 fix):** `lifespan` — the current, non-deprecated way to run startup/shutdown code in FastAPI. An `@asynccontextmanager` function takes `app`, runs setup code, then `yield`s (the app serves requests while "paused" on the yield), and anything after the `yield` would run on shutdown. Wired in via `FastAPI(lifespan=lifespan)`. In this project it's used to validate `GEMINI_API_KEY` exists once, before the app accepts any requests, instead of checking (or failing) inside every request that needs it.
 - **Session 3 (F4 fix):** `fastapi.testclient.TestClient` used as a context manager (`with TestClient(app): ...`) actually runs the app's `lifespan` startup/shutdown events, which is what makes it possible to unit-test startup-time behavior (like our env-var check) without running a real `uvicorn` server.
+- **Session 5 (Step 4):** ASGI vs WSGI — ASGI is the async-capable successor protocol Uvicorn/Starlette/FastAPI speak; it's *why* `async def` route handlers and lifespan hooks work at all. FastAPI = Starlette (ASGI framework: routing, middleware, lifespan) + Pydantic (validation/serialization) + auto-generated OpenAPI docs.
+- **Session 5 (Step 4):** A library can register routes on an `app` object you own, without you writing `@app.get(...)` yourself — `inngest.fast_api.serve(app, ...)` calls FastAPI's own decorators on your instance. Reading a dependency's source (`inspect.getsource`) is a legitimate, fast way to find out exactly what routes/behavior it adds instead of guessing from docs.
+- **Session 5 (Step 4):** `Depends()` — FastAPI's dependency injection: a route parameter typed as `Depends(some_callable)` gets that callable's return value injected automatically, resolved fresh per request (or cached per-request if the same dependency is needed twice). Not used yet in this project, but `get_storage()` (the F5 fix) is already shaped to become one directly.
+- **Session 5 (Step 4):** `lifespan` runs exactly once at process startup/shutdown, not per-request — contrast with `Depends()`, which runs per-request. Different tools for "set up once" vs. "provide fresh/shared state to this specific request."
 
 ## 11. RAG Concepts Learned
 
 - **Session 1:** Grounding/citation pattern — the prompt asks the model to both answer *and* self-report which numbered context chunks it used, which is then parsed back into human-readable sources. This is a cheap way to get attribution without a second retrieval-verification pass, but it trusts the model's self-report (it can hallucinate a `Used:` line that doesn't reflect what it actually relied on).
 - **Session 1:** Chunk/embedding alignment invariant — `chunks`, `sources`, `ids`, `vecs`, `payloads` are all parallel lists indexed by position. Any step that changes list length without updating all four breaks retrieval silently (see finding F3).
+- **Session 5 (Step 4):** Inngest's durable-execution model — a function invocation is replayed via repeated HTTP calls (one per step), not run once end-to-end. Already-completed `ctx.step.run(...)` calls return their memoized result instantly on replay instead of re-executing; only the next incomplete step actually runs. This is *why* steps need to be deterministic/side-effect-safe, and *why* raising a clear exception inside a step (rather than swallowing it) is the correct failure signal — Inngest's retry mechanism is driven entirely by unhandled exceptions. Full detail in §7.3.
 
 ## 12. Bugs / Issues Discovered (Session 1 review — prioritized)
 
@@ -137,6 +184,7 @@ branches are cut — see [§18 Questions & Decisions](#18-questions--decisions).
 | F8 | Low | UX/Correctness | Empty search results still get sent into the LLM prompt as an empty context block rather than short-circuiting with a "no relevant context" response |
 | F9 | Low | Maintainability | Business logic (`_load`, `_upsert`, `_search`) is nested inside Inngest function bodies in `main.py` rather than a separate service/module layer |
 | F10 | Info | Git hygiene | Repo has no completed baseline commit (see §4) — must be fixed before branching |
+| F11 | Low | Config | Discovered Session 5 — `pyproject.toml` console script `fastapiproject:main` doesn't exist (`__init__.py` is empty); the real launch command is `uv run uvicorn fastapiproject.main:app --reload` |
 
 ### F1 — Unvalidated `pdf_path` — ✅ FIXED (Session 2)
 - **WHAT:** `pdf["pdf_path"]` from event payload is passed directly to `Path()` and read, with no restriction on location.
@@ -188,6 +236,13 @@ Documented for awareness; will be addressed opportunistically alongside related 
 ### F10 — Git baseline
 - **SOLUTION:** First commit on `main` will be "baseline: working RAG pipeline as-is" containing the currently-working code untouched, before any fix/feature branch is cut. This gives every subsequent PR a clean diff against real history.
 
+### F11 — Broken console script entry point (discovered Session 5, Step 4)
+- **WHAT:** `pyproject.toml` declares `[project.scripts] fastapiproject = "fastapiproject:main"`, but `src/fastapiproject/__init__.py` is empty — there is no `main` callable in the package.
+- **WHY:** Nothing wires the declared entry point to anything; it was likely scaffolded by `uv init`/`uv build` templates and never filled in.
+- **IMPACT:** Low — doesn't affect the app when run the normal way (`uv run uvicorn fastapiproject.main:app --reload`). But `uv run fastapiproject` (the "obvious" thing to try, especially since `.venv/Scripts/fastapiproject.exe` exists and looks like a real entry point) fails immediately, which is confusing for anyone new to the repo — including, eventually, whoever reads this for a portfolio/resume review.
+- **SOLUTION (not yet applied):** Either (a) add a `main()` function in `__init__.py` that calls `uvicorn.run("fastapiproject.main:app", ...)`, making `uv run fastapiproject` a real, working shortcut, or (b) remove the `[project.scripts]` entry entirely if a single documented `uvicorn` command is preferred. Deferred — low severity, doesn't block Step 4/5.
+- **VERIFICATION (of the finding only):** `python -c "import fastapiproject; print(hasattr(fastapiproject, 'main'))"` → `False`, confirming the entry point is broken as declared.
+
 ## 13. Bugs Fixed
 
 | # | Fixed in | Summary |
@@ -222,11 +277,13 @@ Documented for awareness; will be addressed opportunistically alongside related 
 
 ## 16. Known Limitations (current, as-is)
 
-- No REST API — only reachable via Inngest events.
+- No REST API — only reachable via Inngest events (see §7.3 for exactly how an event reaches this app).
 - No auth/rate limiting.
 - No upload size limits.
 - Streamlit dependency declared but unused.
 - README.md is empty.
+- `uv run fastapiproject` console script is broken (F11) — use `uv run uvicorn fastapiproject.main:app --reload` instead.
+- No incoming validation on Inngest event payloads (raw dict access; see §7.5) — will be addressed structurally by Step 5's Pydantic request models.
 - See §12 for the full findings list.
 
 ## 17. Design Decisions
@@ -326,6 +383,14 @@ main
 - **Could not fully verify:** local Qdrant (`localhost:6333`) was not running this session, so no live end-to-end upsert/search check was possible — noted honestly rather than assumed. Recommend a manual check once Qdrant is running again.
 - **Next:** user's call — remaining low-severity findings (F7–F9), broaden test coverage (F6), or move to Step 4 (explain current FastAPI implementation) ahead of REST API design.
 
+### Session 5 — 2026-08-13
+- User chose Step 4: explain the current FastAPI/Inngest implementation before designing the REST API.
+- Wrote §7 (FastAPI Architecture) covering: the `app` object/ASGI/Uvicorn; how `inngest.fast_api.serve` registers `GET`/`POST`/`PUT /api/inngest` on our `app` (confirmed by reading its source, not assumed); the full request lifecycle including Inngest's step-by-step replay/memoization model and why it makes exception-raising the correct failure signal; Pydantic models' current role (step I/O serialization, not HTTP schemas) vs. their Step 5 future role; the missing-validation gap on incoming event payloads; `Depends()` (unused today, natural fit for `get_storage()` later); and why response/error/status-code handling has nothing to teach yet in this codebase specifically.
+- **Discovered F11** while confirming the "how do you actually run this app" claim: `pyproject.toml`'s `fastapiproject:main` console script is broken (`__init__.py` is empty). Verified via `hasattr(fastapiproject, 'main')` → `False`. Logged, not fixed (low severity, doesn't block Step 5).
+- Added FastAPI/RAG concept notes to §10/§11 (ASGI vs WSGI, route registration via a third-party library, `Depends()`, `lifespan` vs per-request DI, Inngest's durable-execution/replay model).
+- No code changes this session — Step 4 is explanation-only, per the workflow.
+- **Next:** Step 5 — design the REST API (endpoints, request/response schemas, validation, status codes) building on §7's findings, before implementing anything.
+
 ## 23. Before/After Architecture
 
 *(populated as changes land — none yet)*
@@ -333,6 +398,8 @@ main
 ## 24. Remaining Technical Debt
 
 Tracks 1:1 with open items in §12 until each is fixed and moved to §13.
+
+**Trigger condition (from Decision D4):** if Step 6's REST API ends up calling `_upsert`/`_search` (or their successors) directly from a request handler that can receive concurrent traffic, revisit the deferred `AsyncQdrantClient` conversion immediately — don't let it sit as a someday-item once that's true.
 
 ## 25. Recommended Next Steps
 
