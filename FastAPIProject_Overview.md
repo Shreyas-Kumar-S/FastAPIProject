@@ -398,6 +398,7 @@ Q&A log, chronological:
 2. **Q:** GitHub repo creation timing (see D2). **A:** Follow workflow order (hold off).
 3. **Q:** F1 fix — which base directory should `pdf_path` be restricted to? **A (user):** "Let the option to upload be coming from the user via the streamlit UI, there we get the path which needs to be filled in" — i.e., long-term the path should come from an upload widget, not typed text. Interpreted as informing the *eventual* design (Step 5/6), while the *immediate* fix (this session) hardens the current Inngest code path with project-root containment — see D3.
 4. **Q:** How should the new REST endpoints relate to the existing Inngest functions — sync, async, or a mix? **A (user):** Mixed: sync `/ask`, async `/ingest` (the recommended option). Drove the entire Step 5 design — see §8 and Decisions D5/D6.
+5. **Q:** User asked to avoid D5's "direct call the model," concerned it might skip retrieval and break grounding. **Clarified:** retrieval (`search_context`) and grounded prompt construction (`build_prompt`) still run first in `/ask`, unchanged from the Inngest path — "direct call" only refers to which client makes the final network call to Gemini (`google-genai` directly vs. `ctx.step.ai.infer`), not whether retrieved context is used. **A (user):** confirmed this was a misreading, no design change needed. D5 stands as designed.
 
 ## 19. Git Branching Strategy
 
