@@ -143,9 +143,9 @@ FastAPI's `Depends()` lets a route declare a reusable "give me X" dependency (e.
 ### 7.7 Response handling, error handling, HTTP status codes — deferred to Step 5/6
 Today these are entirely Inngest's concern, not ours: `inngest.fast_api.serve`'s handler decides what HTTP status/body the `/api/inngest` routes return, per Inngest's own wire protocol — our code never calls `HTTPException`, sets a `status_code`, or shapes an HTTP response directly. There's genuinely nothing to teach here yet using *this* codebase, because we haven't written a route. Step 5 is where this becomes concrete: choosing `200` vs `201` for ingestion, `404`/`422` for a bad query, and where a real `try/except` → `raise HTTPException(...)` pattern will replace "let it bubble up to Inngest's retry logic" (which is correct for the *event-driven* pipeline, but wrong for a synchronous REST endpoint — a REST caller needs an immediate, well-shaped error response, not a retry three minutes later).
 
-## 8. API Design (Step 5) — not yet implemented
+## 8. API Design (Step 5) — implementation in progress (Step 6)
 
-**Status:** Design only. Nothing in this section is built yet — that's Step 6. Once implemented, this section gets a "✅ implemented, see commit X" pass rather than being rewritten from scratch.
+**Status:** §8.2 (the `rag_service.py` module) is **✅ implemented** (Session 7, `feature/rag-service-extraction`, resolves F9) — see §12/§13 F9. The three endpoints in §8.3 (`POST /ingest`, `GET /ingest/{event_id}/status`, `POST /ask`) are **still design-only**, to be implemented on top of this branch next.
 
 **Chosen shape (user decision, Session 6):** mixed model — `/ask` is synchronous (calls the RAG pipeline directly, answers immediately); `/ingest` stays asynchronous via the existing Inngest event (`rag/ingest_pdf`), backed by a new status-polling endpoint. This was a genuine architectural fork with real trade-offs (see the three options offered) — recorded so a future reader understands *why* the two endpoints behave so differently, rather than assuming it's an inconsistency.
 
@@ -244,7 +244,7 @@ Given the app is about to grow past "everything in `main.py`," endpoints are gro
 | F6 | Medium | Testing | Zero automated tests in the project |
 | F7 | Low | Correctness | Query function's `fn_id="RAG: Query pdf"` and its trigger event `rag/ingest_pdf_ai` are misleading/inconsistent names (ingest vs query) |
 | F8 | Low | UX/Correctness | Empty search results still get sent into the LLM prompt as an empty context block rather than short-circuiting with a "no relevant context" response |
-| F9 | Low | Maintainability | Business logic (`_load`, `_upsert`, `_search`) is nested inside Inngest function bodies in `main.py` rather than a separate service/module layer |
+| F9 | Low | Maintainability | ✅ Fixed (Session 7) — Business logic (`_load`, `_upsert`, `_search`) is nested inside Inngest function bodies in `main.py` rather than a separate service/module layer |
 | F10 | Info | Git hygiene | Repo has no completed baseline commit (see §4) — must be fixed before branching |
 | F11 | Low | Config | Discovered Session 5 — `pyproject.toml` console script `fastapiproject:main` doesn't exist (`__init__.py` is empty); the real launch command is `uv run uvicorn fastapiproject.main:app --reload` |
 
@@ -292,8 +292,18 @@ Given the app is about to grow past "everything in `main.py`," endpoints are gro
 - **WHAT / IMPACT / SOLUTION:** No automated tests exist anywhere. Every fix in Step 3 must land with a corresponding test so regressions are caught mechanically, not by re-reading code.
 - **VERIFICATION:** `pytest` run showing new tests passing, added to this doc's Testing Notes section per change.
 
-### F7, F8, F9 — deferred, low severity
-Documented for awareness; will be addressed opportunistically alongside related work rather than as standalone fixes, to avoid unnecessary churn on working code (per project constraints).
+### F7, F8 — still deferred, low severity
+Documented for awareness; will be addressed opportunistically alongside related work rather than as standalone fixes, to avoid unnecessary churn on working code (per project constraints). (F8 is expected to get resolved as a side effect of Step 6's `/ask` endpoint — see §8.3 — but not touched in the still-unmodified Inngest `rag_query_pdf_ai` function.)
+
+### F9 — Business logic nested in Inngest function bodies — ✅ FIXED (Session 7)
+- **WHAT:** `_load`, `_upsert`, `_search`, plus inline prompt-building and citation-parsing code, lived as closures/inline blocks directly inside `rag_ingest_pdf`/`rag_query_pdf_ai` in `main.py`.
+- **WHY:** Step 5's new REST endpoints need this exact logic too; duplicating it inline in a second place would mean every future bug fix has to be applied twice.
+- **IMPACT (if left unfixed):** `/ask` and `/ingest` would either duplicate the retrieval/prompt/citation logic (drift risk) or be unable to reuse it cleanly.
+- **SOLUTION CHOSEN:** New module `src/fastapiproject/rag_service.py` holds `load_and_chunk_sources`, `embed_and_upsert`, `search_context`, `build_prompt`, `parse_cited_answer`, and the `SYSTEM_INSTRUCTION` constant — exactly the functions specified in the Step 5 design (§8.2). `main.py`'s `_load`/`_upsert`/`_search` closures are now thin wrappers that just call into `rag_service`; `rag_query_pdf_ai` calls `rag_service.build_prompt(...)` and `rag_service.parse_cited_answer(...)` instead of the old inline code. **Pure extraction — no behavior change** to the two Inngest functions.
+  - One small, deliberate addition needed to make the extraction clean: a new `PdfRef` Pydantic model (`custom_types.py`) replaces raw `dict` access for PDF references, since `load_and_chunk_sources` needed a real type to accept instead of `list[dict]`. `_load` now does `[PdfRef(**pdf) for pdf in ctx.event.data["pdfs"]]` before calling the service function — malformed event data now raises a clear Pydantic validation error instead of a raw `KeyError`, a minor incidental improvement, not the point of this change.
+  - **Verified behavior parity for the `source_id` default:** original code used `pdf.get("source_id", pdf_path)` (dict `.get` with a default). The Pydantic equivalent can't perfectly distinguish "key missing" from "key explicitly `null`" (both become `None` after parsing) — `load_and_chunk_sources` uses `pdf.source_id if pdf.source_id is not None else pdf.pdf_path`, which matches original behavior for every realistic input (missing key, or a real string value) and only diverges in the never-actually-used case of an event explicitly sending `"source_id": null`. Documented here rather than silently claimed identical.
+- **TESTS ADDED:** `tests/test_rag_service.py` (9 cases, all mocked — no real Gemini/Qdrant calls): `load_and_chunk_sources` (source_id defaulting, explicit source_id, multi-PDF combination), `embed_and_upsert` (deterministic ids, correct payload shape), `search_context` (correct args passed through, result shape), `build_prompt` (context numbering, question inclusion), `parse_cited_answer` (citation extraction, empty `Used: []`, fallback when no citation line present).
+- **VERIFICATION PERFORMED:** `uv run pytest -q` → 20/20 passed (full project total). Manually confirmed `main.py` still imports cleanly, and re-ran `rag_service.load_and_chunk_sources` against the real `test.pdf` end-to-end (same chunk/source output as before the extraction).
 
 ### F10 — Git baseline
 - **SOLUTION:** First commit on `main` will be "baseline: working RAG pipeline as-is" containing the currently-working code untouched, before any fix/feature branch is cut. This gives every subsequent PR a clean diff against real history.
@@ -313,6 +323,7 @@ Documented for awareness; will be addressed opportunistically alongside related 
 | F3 | Session 3, branch `fix/rag-pipeline-hardening` | `embed_texts` now validates embedding count and non-`None` values, raising `RuntimeError` instead of silently misaligning ids/vectors/payloads; see F3 in §12. |
 | F4 | Session 3, branch `fix/rag-pipeline-hardening` | Added FastAPI `lifespan` startup check for `GEMINI_API_KEY`; app now fails fast at boot with a clear message instead of a buried `KeyError` mid-request; see F4 in §12. |
 | F5 (partial) | Session 4, branch `fix/rag-pipeline-hardening` | Added `get_storage()` singleton in `vector_db.py` — one `QdrantClient` and one `collection_exists` check per process instead of per call. Async-client conversion deferred, see D4. |
+| F9 | Session 7, branch `feature/rag-service-extraction` | Extracted `_load`/`_upsert`/`_search`/prompt-building/citation-parsing into new `rag_service.py`; `main.py`'s Inngest functions now call into it, no behavior change. See F9 in §12. |
 
 ## 14. Features Added
 
@@ -328,12 +339,15 @@ Documented for awareness; will be addressed opportunistically alongside related 
 | `tests/test_embed_texts.py` | `embed_texts` (F3 fix), mocked `client.models.embed_content` | correct-length response returns matching vectors; short response raises `RuntimeError`; `None`-valued embedding raises `RuntimeError` | 3/3 passed |
 | `tests/test_main_startup.py` | `lifespan` startup validation (F4 fix), via `TestClient` + `monkeypatch` | app starts with `GEMINI_API_KEY` set; app raises `RuntimeError` at startup when it's unset | 2/2 passed |
 | `tests/test_vector_db.py` | `get_storage()` singleton (F5 fix), mocked `QdrantStorage` class | constructs only once across repeated calls; reuses an existing singleton without re-constructing | 2/2 passed |
+| `tests/test_rag_service.py` | `rag_service.py` (F9 extraction), fully mocked (no real Gemini/Qdrant calls) | `load_and_chunk_sources` source_id defaulting/explicit/multi-PDF; `embed_and_upsert` deterministic ids + payload shape; `search_context` args/result shape; `build_prompt` numbering/question; `parse_cited_answer` extraction/empty-list/no-citation-line fallback | 9/9 passed |
 
-**Running total:** `uv run pytest -q` → 11/11 passed (Session 4).
+**Running total:** `uv run pytest -q` → 20/20 passed (Session 7).
 
 **Manual verification (Session 2):** `load_and_chunk_pdf('test.pdf')` re-run against the real sample file with the real Gemini API key loaded — succeeded (1 chunk extracted), confirming F1's fix didn't regress the already-working ingestion path. `load_and_chunk_pdf('../../test.pdf')` confirmed rejected.
 
 **Manual verification (Session 3):** `embed_texts(['hello world', 'second chunk of text'])` re-run against the real Gemini API — returned 2 vectors, dim 3072 each, confirming F3's fix doesn't regress the successful embedding path.
+
+**Manual verification (Session 7):** `main.py` still imports cleanly after the `rag_service` swap; `rag_service.load_and_chunk_sources([PdfRef(pdf_path='test.pdf')])` re-run end-to-end against the real `test.pdf` — same chunk/source output as before the extraction.
 
 **Manual verification (Session 4):** Confirmed `main.py` still imports cleanly after swapping `QdrantStorage()` calls for `get_storage()`. Could **not** verify end-to-end against a real Qdrant instance — `localhost:6333` was unreachable this session (Qdrant not running). Recommend re-running `_upsert`/`_search` manually once Qdrant is up, before relying on this in a demo.
 
@@ -402,15 +416,15 @@ Q&A log, chronological:
 
 ## 19. Git Branching Strategy
 
-**Updated Session 6, post-Step-5-design.** `fix/rag-pipeline-hardening` (F1, F3, F4, F5, Step 4 docs) is done but not yet merged to `main` — no GitHub remote exists yet (Decision D2), so it's still a local stack of one branch. Step 6 implementation will stack on top of it, since it depends on all of those fixes (especially F5's `get_storage()` and F1's `resolve_safe_pdf_path`, both reused directly by the new endpoints):
+**Updated Session 7.** `fix/rag-pipeline-hardening` (F1, F3, F4, F5, Step 4/5 docs) is done but not yet merged to `main` — no GitHub remote exists yet (Decision D2). `feature/rag-service-extraction`, branched from it, is also now done (F9). Both are still local-only stacked branches:
 
 ```
 main
- └── fix/rag-pipeline-hardening         (done: F1, F3, F4, F5, Step 4 docs — 4 commits)
-      └── feature/rag-service-extraction (Step 6: rag_service.py — F9, no behavior change)
-           └── feature/ask-endpoint      (Step 6: POST /ask, depends on rag_service)
-                └── feature/ingest-endpoint (Step 6: POST /ingest + status, depends on rag_service)
-                     └── feature/api-tests   (Step 6: endpoint test coverage for all three)
+ └── fix/rag-pipeline-hardening          (done: F1, F3, F4, F5, Step 4/5 docs — 6 commits)
+      └── feature/rag-service-extraction (done: rag_service.py — F9, no behavior change — 1 commit)
+           └── feature/ask-endpoint      (next: POST /ask, depends on rag_service)
+                └── feature/ingest-endpoint (POST /ingest + status, depends on rag_service)
+                     └── feature/api-tests   (endpoint test coverage for all three)
 ```
 
 `feature/rag-service-extraction` is the base of the stack (not `feature/fastapi-foundation` as originally sketched in Session 1 — that name predated the actual design; the real first step is the extraction, since both new endpoints and the untouched Inngest functions depend on it).
@@ -480,6 +494,19 @@ main
 - Noted `/ask`'s design will finally resolve deferred finding F8 (empty-context short-circuit) since that code path is new anyway.
 - No code changes this session — Step 5 is design-only, per the workflow. §8 is explicitly marked "not yet implemented."
 - **Next:** Step 6 — implement the endpoints incrementally (branch `feature/fastapi-foundation` → `feature/ask-endpoint` → `feature/ingest-endpoint` → `feature/api-tests`, per §19's planned branching), starting with the `rag_service.py` extraction since both new endpoints and the existing Inngest functions depend on it.
+- User asked to confirm D5 doesn't skip retrieval/grounding — clarified and confirmed as a misreading, no design change; recorded as §18 Q5.
+
+### Session 7 — 2026-08-13
+- User said start Step 6. Began with the `rag_service.py` extraction (base of the branch stack), since both `/ask`/`/ingest` and the existing Inngest functions depend on it.
+- Branched `feature/rag-service-extraction` off `fix/rag-pipeline-hardening`.
+- Added `PdfRef` model to `custom_types.py`; created `src/fastapiproject/rag_service.py` with `load_and_chunk_sources`, `embed_and_upsert`, `search_context`, `build_prompt`, `parse_cited_answer`, `SYSTEM_INSTRUCTION` — exactly matching the Step 5 design (§8.2).
+- Rewrote `main.py`'s `_load`/`_upsert`/`_search` closures to call into `rag_service` instead of containing the logic inline; `rag_query_pdf_ai` now calls `rag_service.build_prompt`/`parse_cited_answer`. Removed now-unused `uuid`/`re` imports (their logic moved to `rag_service.py`).
+- Noted and documented one subtlety while extracting: matching `.get("source_id", pdf_path)`'s exact fallback semantics with a Pydantic model isn't perfectly possible (can't distinguish "missing key" from "explicit null" post-parse) — used the closest faithful equivalent and wrote down the one never-hit edge case where it diverges, rather than silently claiming zero behavior change. Full detail under F9 in §12.
+- **Fixed F9** (resolves the "business logic nested in Inngest functions" finding).
+- Added `tests/test_rag_service.py` (9 cases, fully mocked).
+- **Tests run:** `uv run pytest -q` → 20/20 passed (full project total).
+- **Manual verification:** `main.py` imports cleanly; `rag_service.load_and_chunk_sources` re-run end-to-end against the real `test.pdf`, same output as pre-extraction.
+- **Next:** implement `POST /ask` on a new `feature/ask-endpoint` branch stacked on top of this one.
 
 ## 23. Before/After Architecture
 

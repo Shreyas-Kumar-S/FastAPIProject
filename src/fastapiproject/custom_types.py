@@ -1,5 +1,9 @@
 import pydantic
 
+class PdfRef(pydantic.BaseModel):
+    pdf_path: str
+    source_id: str | None = None
+
 class RagChunkAndSource(pydantic.BaseModel):
     chunks: list[str]
     sources: list[str]
