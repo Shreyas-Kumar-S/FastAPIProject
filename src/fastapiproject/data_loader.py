@@ -38,9 +38,20 @@ def load_and_chunk_pdf(path:str):
         chunks.extend(splitter.split_text(t))
     return chunks
 
-def embed_texts(texts:list[str]) -> list[list[float | int] | None]:
+def embed_texts(texts: list[str]) -> list[list[float]]:
     response = client.models.embed_content(
         model=EMBED_MODEL,
         contents=texts,
     )
-    return [item.values for item in response.embeddings or []]
+    embeddings = response.embeddings or []
+    if len(embeddings) != len(texts):
+        raise RuntimeError(
+            f"Embedding count mismatch: requested {len(texts)} embeddings, "
+            f"got {len(embeddings)}. Refusing to return misaligned vectors."
+        )
+    vectors: list[list[float]] = []
+    for i, item in enumerate(embeddings):
+        if item.values is None:
+            raise RuntimeError(f"Embedding at index {i} returned no values")
+        vectors.append(item.values)
+    return vectors
