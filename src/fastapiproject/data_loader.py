@@ -38,8 +38,8 @@ def load_and_chunk_pdf(path:str):
         chunks.extend(splitter.split_text(t))
     return chunks
 
-def embed_texts(texts: list[str]) -> list[list[float]]:
-    response = client.models.embed_content(
+async def embed_texts(texts: list[str]) -> list[list[float]]:
+    response = await client.aio.models.embed_content(
         model=EMBED_MODEL,
         contents=texts,
     )
