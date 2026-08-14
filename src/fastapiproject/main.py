@@ -51,8 +51,8 @@ async def rag_ingest_pdf(ctx: inngest.Context):
         pdfs = [PdfRef(**pdf) for pdf in ctx.event.data["pdfs"]]
         return rag_service.load_and_chunk_sources(pdfs)
 
-    def _upsert(chunks_and_src : RagChunkAndSource) -> RagUpsertResult:
-        return rag_service.embed_and_upsert(chunks_and_src)
+    async def _upsert(chunks_and_src : RagChunkAndSource) -> RagUpsertResult:
+        return await rag_service.embed_and_upsert(chunks_and_src)
 
     chunks_and_src = await ctx.step.run("Load and Chunk pdf",lambda : _load(ctx), output_type=RagChunkAndSource)
     ingested = await ctx.step.run("Embedding and upsert", lambda : _upsert(chunks_and_src), output_type=RagUpsertResult)
@@ -65,8 +65,8 @@ async def rag_ingest_pdf(ctx: inngest.Context):
 )
 
 async def rag_query_pdf_ai(ctx: inngest.Context):
-    def _search(question:str, top_k: int = 5, score_threshold: float = 0.5) -> RagSearchResult:
-        return rag_service.search_context(question, top_k, score_threshold)
+    async def _search(question:str, top_k: int = 5, score_threshold: float = 0.5) -> RagSearchResult:
+        return await rag_service.search_context(question, top_k, score_threshold)
 
     question = ctx.event.data["question"]
     top_k = int(ctx.event.data.get("top_k",5))
