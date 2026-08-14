@@ -20,3 +20,8 @@ class QueryResult(pydantic.BaseModel):
     sources: list[str]
     num_contexts: int
 
+class AskRequest(pydantic.BaseModel):
+    question: str = pydantic.Field(min_length=1)
+    top_k: int = pydantic.Field(default=5, ge=1, le=20)
+    score_threshold: float = pydantic.Field(default=0.5, ge=0.0, le=1.0)
+
