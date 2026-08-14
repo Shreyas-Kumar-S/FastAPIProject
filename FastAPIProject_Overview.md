@@ -145,7 +145,7 @@ Today these are entirely Inngest's concern, not ours: `inngest.fast_api.serve`'s
 
 ## 8. API Design (Step 5) — implementation in progress (Step 6)
 
-**Status:** §8.2 (the `rag_service.py` module) is **✅ implemented** (Session 7, `feature/rag-service-extraction`, resolves F9) — see §12/§13 F9. The three endpoints in §8.3 (`POST /ingest`, `GET /ingest/{event_id}/status`, `POST /ask`) are **still design-only**, to be implemented on top of this branch next.
+**Status:** §8.2 (the `rag_service.py` module) is **✅ implemented** (Session 7, `feature/rag-service-extraction`, resolves F9) — see §12/§13 F9. `POST /ask` (§8.3) is **✅ implemented** (Session 8, `feature/ask-endpoint`) — see §12/§13 F5, F8. `POST /ingest` and `GET /ingest/{event_id}/status` are **still design-only**, next up per §19's branch stack.
 
 **Chosen shape (user decision, Session 6):** mixed model — `/ask` is synchronous (calls the RAG pipeline directly, answers immediately); `/ingest` stays asynchronous via the existing Inngest event (`rag/ingest_pdf`), backed by a new status-polling endpoint. This was a genuine architectural fork with real trade-offs (see the three options offered) — recorded so a future reader understands *why* the two endpoints behave so differently, rather than assuming it's an inconsistency.
 
@@ -240,10 +240,10 @@ Given the app is about to grow past "everything in `main.py`," endpoints are gro
 | F2 | Critical | Correctness | ✅ Verified working (Session 2, user tested against real API with their key) — Gemini model id `gemini-3.6-flash` |
 | F3 | High | Correctness | ✅ Fixed (Session 3) — `embed_texts` result not checked for `None`/length mismatch before upsert |
 | F4 | High | Reliability | ✅ Fixed (Session 3) — `GEMINI_API_KEY` only validated at call time, not startup |
-| F5 | Medium | Performance | ⚠️ Partially fixed (Session 4) — singleton client done; async-client conversion deferred, see D4 |
+| F5 | Medium | Performance | ✅ Fixed (Session 8) — singleton client (Session 4) + full `AsyncQdrantClient`/async-genai conversion (Session 8, see D7) |
 | F6 | Medium | Testing | Zero automated tests in the project |
 | F7 | Low | Correctness | Query function's `fn_id="RAG: Query pdf"` and its trigger event `rag/ingest_pdf_ai` are misleading/inconsistent names (ingest vs query) |
-| F8 | Low | UX/Correctness | Empty search results still get sent into the LLM prompt as an empty context block rather than short-circuiting with a "no relevant context" response |
+| F8 | Low | UX/Correctness | ✅ Fixed (Session 8) — resolved as a side effect of implementing `POST /ask`'s empty-context short-circuit (`rag_service.answer_question`). Only fixed on the new `/ask` path; the existing Inngest `rag_query_pdf_ai` function is untouched, per "no behavior change" |
 | F9 | Low | Maintainability | ✅ Fixed (Session 7) — Business logic (`_load`, `_upsert`, `_search`) is nested inside Inngest function bodies in `main.py` rather than a separate service/module layer |
 | F10 | Info | Git hygiene | Repo has no completed baseline commit (see §4) — must be fixed before branching |
 | F11 | Low | Config | Discovered Session 5 — `pyproject.toml` console script `fastapiproject:main` doesn't exist (`__init__.py` is empty); the real launch command is `uv run uvicorn fastapiproject.main:app --reload` |
@@ -323,11 +323,15 @@ Documented for awareness; will be addressed opportunistically alongside related 
 | F3 | Session 3, branch `fix/rag-pipeline-hardening` | `embed_texts` now validates embedding count and non-`None` values, raising `RuntimeError` instead of silently misaligning ids/vectors/payloads; see F3 in §12. |
 | F4 | Session 3, branch `fix/rag-pipeline-hardening` | Added FastAPI `lifespan` startup check for `GEMINI_API_KEY`; app now fails fast at boot with a clear message instead of a buried `KeyError` mid-request; see F4 in §12. |
 | F5 (partial) | Session 4, branch `fix/rag-pipeline-hardening` | Added `get_storage()` singleton in `vector_db.py` — one `QdrantClient` and one `collection_exists` check per process instead of per call. Async-client conversion deferred, see D4. |
+| F5 (full) | Session 8, branch `feature/ask-endpoint` | Converted `vector_db.QdrantStorage` to `AsyncQdrantClient`, `data_loader.embed_texts` to `client.aio.models.embed_content`, and `rag_service`'s `embed_and_upsert`/`search_context`/`generate_answer`/`answer_question` to `async def`. See F5 in §12 and Decision D7. |
+| F8 | Session 8, branch `feature/ask-endpoint` | `rag_service.answer_question` short-circuits with `NO_CONTEXT_ANSWER` when `search_context` returns no contexts, instead of sending an empty context block to Gemini. Only applies to the new `/ask` path. See F8 in §12. |
 | F9 | Session 7, branch `feature/rag-service-extraction` | Extracted `_load`/`_upsert`/`_search`/prompt-building/citation-parsing into new `rag_service.py`; `main.py`'s Inngest functions now call into it, no behavior change. See F9 in §12. |
 
 ## 14. Features Added
 
-*(none yet)*
+| Feature | Added in | Summary |
+|---|---|---|
+| `POST /ask` | Session 8, branch `feature/ask-endpoint` | Synchronous REST endpoint per the §8.3 design: `AskRequest` (validated `question`/`top_k`/`score_threshold`), calls `rag_service.answer_question` (retrieval → empty-context short-circuit (F8) → prompt → direct Gemini call (Decision D5) → citation parsing), returns `QueryResult`. Registered via a new `src/fastapiproject/routers.py` `APIRouter` (§8.5), included into `app` in `main.py`. Maps Qdrant connection failures to `503`; validation failures are automatic `422`s from Pydantic. |
 
 ## 15. Tests
 
@@ -336,12 +340,13 @@ Documented for awareness; will be addressed opportunistically alongside related 
 | File | Covers | Cases | Result |
 |---|---|---|---|
 | `tests/test_data_loader.py` | `resolve_safe_pdf_path` (F1 fix) | relative path inside root resolves; `..` traversal outside root rejected (`ValueError`); absolute path outside root rejected (`ValueError`); missing file inside root raises `FileNotFoundError` | 4/4 passed |
-| `tests/test_embed_texts.py` | `embed_texts` (F3 fix), mocked `client.models.embed_content` | correct-length response returns matching vectors; short response raises `RuntimeError`; `None`-valued embedding raises `RuntimeError` | 3/3 passed |
+| `tests/test_embed_texts.py` | `embed_texts` (F3 fix; F5 async conversion), mocked `client.aio.models.embed_content` | correct-length response returns matching vectors; short response raises `RuntimeError`; `None`-valued embedding raises `RuntimeError` (all async since Session 8) | 3/3 passed |
 | `tests/test_main_startup.py` | `lifespan` startup validation (F4 fix), via `TestClient` + `monkeypatch` | app starts with `GEMINI_API_KEY` set; app raises `RuntimeError` at startup when it's unset | 2/2 passed |
-| `tests/test_vector_db.py` | `get_storage()` singleton (F5 fix), mocked `QdrantStorage` class | constructs only once across repeated calls; reuses an existing singleton without re-constructing | 2/2 passed |
-| `tests/test_rag_service.py` | `rag_service.py` (F9 extraction), fully mocked (no real Gemini/Qdrant calls) | `load_and_chunk_sources` source_id defaulting/explicit/multi-PDF; `embed_and_upsert` deterministic ids + payload shape; `search_context` args/result shape; `build_prompt` numbering/question; `parse_cited_answer` extraction/empty-list/no-citation-line fallback | 9/9 passed |
+| `tests/test_rag_service.py` | `rag_service.py` (F9 extraction; F5/F8/`/ask` additions), fully mocked (no real Gemini/Qdrant calls) | `load_and_chunk_sources` source_id defaulting/explicit/multi-PDF; `embed_and_upsert` deterministic ids + payload shape (async); `search_context` args/result shape (async); `build_prompt` numbering/question; `parse_cited_answer` extraction/empty-list/no-citation-line fallback; `generate_answer` calls Gemini via `client.aio.models.generate_content` and strips the response (async); `answer_question` short-circuits on empty context (F8) / builds prompt + parses citation on real context (async) | 12/12 passed |
+| `tests/test_vector_db.py` | `QdrantStorage`/`get_storage()`, mocked `AsyncQdrantClient` | singleton construct-once/reuse (unchanged); `upsert` creates collection when missing / skips when present / only checks existence once across calls; `search` returns context+sources from matched points | 6/6 passed |
+| `tests/test_ask_endpoint.py` | `POST /ask` end-to-end via `TestClient`, `rag_service.answer_question` mocked (auto-`AsyncMock`'d since the target is `async def`) | 200 with answer; custom `top_k`/`score_threshold` passed through; empty `question` → 422; `top_k` out of `[1,20]` bounds → 422; Qdrant `ApiException` → 503 | 5/5 passed |
 
-**Running total:** `uv run pytest -q` → 20/20 passed (Session 7).
+**Running total:** `uv run pytest -q` → 32/32 passed (Session 8).
 
 **Manual verification (Session 2):** `load_and_chunk_pdf('test.pdf')` re-run against the real sample file with the real Gemini API key loaded — succeeded (1 chunk extracted), confirming F1's fix didn't regress the already-working ingestion path. `load_and_chunk_pdf('../../test.pdf')` confirmed rejected.
 
@@ -353,7 +358,7 @@ Documented for awareness; will be addressed opportunistically alongside related 
 
 ## 16. Known Limitations (current, as-is)
 
-- No REST API yet — designed in §8 (Step 5), not implemented until Step 6.
+- `POST /ask` is implemented (Session 8); `POST /ingest` and `GET /ingest/{event_id}/status` are still design-only (§8), not yet implemented.
 - No auth/rate limiting (still true after Step 5's design — not in scope; would be a Step 7+ concern).
 - No upload size limits on the *existing* Inngest-event ingestion path (Step 5's `/ingest` design closes this for the new endpoint specifically — see §8.3).
 - Streamlit dependency declared but unused.
@@ -404,6 +409,20 @@ Documented for awareness; will be addressed opportunistically alongside related 
 **Reason:** Follows directly from Decision D3 (Session 2) — the user's stated direction was for `pdf_path` to eventually come from an upload flow, not typed/referenced text. Since Step 5 is a from-scratch design (no existing REST behavior to preserve), there's no reason to design the worse intermediate version first. `resolve_safe_pdf_path` (F1) still does exactly the same job here — validating the path *after* our own code generates it, as defense in depth.
 **Trade-off:** More implementation work in Step 6 (multipart handling, filename sanitization, size limits) than a JSON-body version would need — accepted, since it's the design that's actually useful for a live demo/portfolio piece.
 
+### D7 — Convert to `AsyncQdrantClient`/async Gemini calls now, inside `feature/ask-endpoint` (resolves F5 fully, supersedes D4)
+**Question:** D4 deferred the `AsyncQdrantClient` conversion with an explicit trigger: revisit immediately once a REST endpoint sends concurrent traffic through `search_context`/`embed_and_upsert`. `POST /ask` (Session 8) does exactly that — do the conversion now, or keep deferring?
+**Refinement discovered this session:** `routers.ask` is a **sync** `def` path operation (`def ask(...)`, not `async def`). FastAPI/Starlette runs sync path operations in a threadpool automatically, not on the main event loop — this is a materially different situation from D4's original finding (Inngest's `ctx.step.run` calls sync handlers *directly on the event loop*, confirmed by reading `step_async.py` in Session 4). So the specific failure mode D4 warned about (stalling the whole event loop, blocking every other in-flight request) does not reproduce for `/ask` the way it would have for an Inngest step. The remaining risk is milder: threadpool exhaustion (Starlette's default pool is ~40 workers) under heavy concurrent `/ask` load, causing queued requests/latency rather than a full stall.
+**Options presented:** (A) Defer — log the refined trigger condition, do the conversion as its own future branch. (B) Convert now — `AsyncQdrantClient`, `client.aio.models.embed_content`/`generate_content`, `async def` throughout `rag_service.py`, inside this branch.
+**Decision:** B (user's explicit choice after reviewing the pros/cons, overriding the assistant's recommendation of A).
+**What changed:**
+- `vector_db.QdrantStorage`: `QdrantClient` → `AsyncQdrantClient`. `collection_exists`/`create_collection` can't run in `__init__` anymore (async), so they moved into a new `_ensure_collection()` method, called lazily on the first `upsert()`/`search()` and cached via a `_collection_ready` flag — same "once per process" behavior as before, just deferred to first use instead of construction. `get_storage()` itself is **unchanged and still sync** — building an `AsyncQdrantClient` object does no I/O, only calling its methods does.
+- `data_loader.embed_texts`: → `async def`, uses `client.aio.models.embed_content` (confirmed via Context7 docs — same `genai.Client()` instance exposes both `.models` (sync) and `.aio.models` (async), no separate client needed).
+- `rag_service.py`: `embed_and_upsert`, `search_context`, `generate_answer`, `answer_question` all → `async def`, awaiting their now-async dependencies. `generate_answer` uses `client.aio.models.generate_content` (also confirmed via Context7).
+- `main.py`: `rag_ingest_pdf`'s `_upsert` and `rag_query_pdf_ai`'s `_search` closures → `async def`, `await`ing into `rag_service`. **No change needed to the `ctx.step.run(lambda: _upsert(...), ...)` call sites** — confirmed by reading `step_async.py`/`transforms.maybe_await`: Inngest's `ctx.step.run` already detects when a sync-looking handler call returns a coroutine and awaits it (`transforms.maybe_await`), so the lambda-wrapping pattern keeps working unchanged. `_load` stays sync (PDF parsing has no async-capable dependency).
+- `routers.ask`: → `async def`, `await`s `rag_service.answer_question`.
+- Added `pytest-asyncio` as a dev dependency + `asyncio_mode = "auto"` in `pyproject.toml` — required for `async def test_...` functions to actually execute their bodies (verified this was broken before adding it: a bare `async def test_x(): raise AssertionError(...)` silently "passed" with only a `RuntimeWarning`, since nothing awaited the test coroutine).
+**Trade-off:** This is a wider-than-originally-scoped change for a branch whose stated purpose (§19) was "implement `POST /ask`" — it touches `vector_db.py`, `data_loader.py`, `rag_service.py`, and `main.py`'s existing (working, previously "no behavior change") Inngest closures. Accepted as the user's explicit call after reviewing the cost/benefit table. **Could not be verified end-to-end against real Qdrant or a real Gemini API key this session** — `localhost:6333` unreachable and no `GEMINI_API_KEY` set in this session's environment (same class of limitation as Session 4's Qdrant check). All behavior is verified via mocked tests only (32/32 passing); a live check is recommended before relying on this in a demo.
+
 ## 18. Questions & Decisions
 
 Q&A log, chronological:
@@ -416,14 +435,14 @@ Q&A log, chronological:
 
 ## 19. Git Branching Strategy
 
-**Updated Session 7.** `fix/rag-pipeline-hardening` (F1, F3, F4, F5, Step 4/5 docs) is done but not yet merged to `main` — no GitHub remote exists yet (Decision D2). `feature/rag-service-extraction`, branched from it, is also now done (F9). Both are still local-only stacked branches:
+**Updated Session 8.** `fix/rag-pipeline-hardening` (F1, F3, F4, F5-partial, Step 4/5 docs) and `feature/rag-service-extraction` (F9) are done but not yet merged to `main` — no GitHub remote exists yet (Decision D2). `feature/ask-endpoint`, branched from the extraction branch, is also now done (`POST /ask`, F5-full via D7, F8). All still local-only stacked branches:
 
 ```
 main
- └── fix/rag-pipeline-hardening          (done: F1, F3, F4, F5, Step 4/5 docs — 6 commits)
+ └── fix/rag-pipeline-hardening          (done: F1, F3, F4, F5-partial, Step 4/5 docs — 6 commits)
       └── feature/rag-service-extraction (done: rag_service.py — F9, no behavior change — 1 commit)
-           └── feature/ask-endpoint      (next: POST /ask, depends on rag_service)
-                └── feature/ingest-endpoint (POST /ingest + status, depends on rag_service)
+           └── feature/ask-endpoint      (done: POST /ask, F5-full async conversion (D7), F8 — this session)
+                └── feature/ingest-endpoint (next: POST /ingest + status, depends on rag_service)
                      └── feature/api-tests   (endpoint test coverage for all three)
 ```
 
@@ -508,6 +527,19 @@ main
 - **Manual verification:** `main.py` imports cleanly; `rag_service.load_and_chunk_sources` re-run end-to-end against the real `test.pdf`, same output as pre-extraction.
 - **Next:** implement `POST /ask` on a new `feature/ask-endpoint` branch stacked on top of this one.
 
+### Session 8 — 2026-08-14
+- Reverted a stray uncommitted one-line edit (`what`) accidentally left in `main.py`'s `rag_query_pdf_ai` from a prior session — unrelated to any planned work.
+- Branched `feature/ask-endpoint` off `feature/rag-service-extraction`.
+- Looked up exact API syntax via Context7 before writing any code: `google-genai`'s `client.models.generate_content(model, contents, config=types.GenerateContentConfig(system_instruction, temperature, max_output_tokens))` for sync, and confirmed `client.aio.models.embed_content`/`generate_content` for the later async pass; `qdrant-client`'s `AsyncQdrantClient` (mirrors the sync client's method names, all awaited).
+- **Implemented `POST /ask`** via TDD (red-green per unit): added `rag_service.generate_answer` (direct Gemini call, Decision D5) and `rag_service.answer_question` (orchestrates `search_context` → empty-context short-circuit (resolves F8) → `build_prompt` → `generate_answer` → `parse_cited_answer`); added `AskRequest` to `custom_types.py`; created `src/fastapiproject/routers.py` (`ask_router`, per §8.5's routing-organization design) and wired it into `app` via `app.include_router(...)`. Maps `qdrant_client.http.exceptions.ApiException` to `503`; validation and other unhandled errors use FastAPI's automatic `422`/`500`.
+- Confirmed via `main.app.openapi()['paths']` that `/ask` is registered correctly alongside `/api/inngest`.
+- **Decision D7:** user asked to review Decision D4's deferred `AsyncQdrantClient` conversion now that `/ask` sends REST traffic through `search_context`/`embed_and_upsert` (D4's own trigger condition). Assistant found a refinement — `/ask`'s route handler is sync `def`, which FastAPI runs in a threadpool, not on the event loop, so D4's specific "blocks the event loop" concern doesn't reproduce the same way it did for Inngest steps — and presented a pros/cons table recommending deferral. User chose to convert now anyway. Full writeup, including the Inngest-closure interaction (`ctx.step.run`'s `maybe_await` behavior, confirmed by reading `transforms.py`), under D7 in §17.
+- **Converted to async:** `vector_db.QdrantStorage` (→ `AsyncQdrantClient`, lazy `_ensure_collection()`), `data_loader.embed_texts` (→ `client.aio.models.embed_content`), `rag_service.embed_and_upsert`/`search_context`/`generate_answer`/`answer_question` (→ `async def`), `main.py`'s `_upsert`/`_search` Inngest closures (→ `async def`, no change needed to their `ctx.step.run(lambda: ...)` call sites), `routers.ask` (→ `async def`).
+- Added `pytest-asyncio` as a dev dependency and `asyncio_mode = "auto"` to `pyproject.toml` — discovered and fixed a real gap first: a plain `async def test_...` function's body silently never ran without this (verified with a throwaway sanity test that raised `AssertionError` inside an async body and still reported "passed" until the plugin was added).
+- **Tests run:** `uv run pytest -q` → 32/32 passed (12 new/updated in `test_rag_service.py`, `test_vector_db.py` rewritten for async (6 cases, including new coverage for the previously-untested `_ensure_collection`/`upsert`/`search` internals), `test_embed_texts.py` converted to async (3 cases), new `tests/test_ask_endpoint.py` (5 cases)). Also ran with `-W error::RuntimeWarning` to positively confirm no unawaited-coroutine warnings anywhere in the suite.
+- **Could not verify live:** neither `localhost:6333` (Qdrant) nor a real `GEMINI_API_KEY` was available in this session — same class of gap Session 4 hit for the partial F5 fix. `main.py` confirmed to import cleanly and register `/ask` correctly; all behavior otherwise verified via mocks only. Flagged in §24, not silently skipped.
+- **Next:** `feature/ingest-endpoint` (`POST /ingest` + `GET /ingest/{event_id}/status`, per §19's branch stack), or a live smoke test of `/ask`/the Inngest functions against a running Qdrant + real Gemini key first — user's call.
+
 ## 23. Before/After Architecture
 
 *(populated as changes land — none yet)*
@@ -516,7 +548,7 @@ main
 
 Tracks 1:1 with open items in §12 until each is fixed and moved to §13.
 
-**Trigger condition (from Decision D4):** if Step 6's REST API ends up calling `_upsert`/`_search` (or their successors) directly from a request handler that can receive concurrent traffic, revisit the deferred `AsyncQdrantClient` conversion immediately — don't let it sit as a someday-item once that's true.
+**D4's trigger condition fired and was resolved in Session 8** — see Decision D7. The `AsyncQdrantClient`/async-Gemini conversion is done, but **not yet verified against a live Qdrant instance or a real Gemini API key** (neither was reachable/configured this session). Recommend a live smoke test of `/ask` (and the still-sync-but-now-calling-async-code Inngest functions) before relying on this in a demo — this is the same class of gap Session 4 left open for F5's partial fix, now inherited by the full fix.
 
 ## 25. Recommended Next Steps
 
