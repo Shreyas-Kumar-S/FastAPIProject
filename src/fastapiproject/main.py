@@ -13,6 +13,7 @@ import os
 import datetime
 from fastapiproject import rag_service
 from fastapiproject.custom_types import PdfRef,RagChunkAndSource,QueryResult,RagSearchResult,RagUpsertResult
+from fastapiproject.routers import ask_router
 
 load_dotenv()
 
@@ -102,5 +103,6 @@ async def rag_query_pdf_ai(ctx: inngest.Context):
 
     return {"answers":answer,"sources": cited_sources, "num_contexts": len(found.contexts)}
 app = FastAPI(lifespan=lifespan)
+app.include_router(ask_router)
 
 inngest.fast_api.serve(app,inngest_client,[rag_ingest_pdf, rag_query_pdf_ai])
