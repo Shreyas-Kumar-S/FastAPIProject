@@ -25,3 +25,13 @@ class AskRequest(pydantic.BaseModel):
     top_k: int = pydantic.Field(default=5, ge=1, le=20)
     score_threshold: float = pydantic.Field(default=0.5, ge=0.0, le=1.0)
 
+class IngestResponse(pydantic.BaseModel):
+    event_id: str
+    status_url: str
+
+class IngestStatusResponse(pydantic.BaseModel):
+    event_id: str
+    status: str
+    ingested: int | None = None
+    error: str | None = None
+

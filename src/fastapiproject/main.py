@@ -14,7 +14,7 @@ import datetime
 from fastapiproject import rag_service
 from fastapiproject.custom_types import PdfRef,RagChunkAndSource,QueryResult,RagSearchResult,RagUpsertResult
 from fastapiproject.inngest_client import client as inngest_client
-from fastapiproject.routers import ask_router
+from fastapiproject.routers import ask_router, ensure_upload_dir, ingest_router
 
 load_dotenv()
 
@@ -32,6 +32,7 @@ def _validate_required_env_vars() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _validate_required_env_vars()
+    ensure_upload_dir()
     yield
 
 @inngest_client.create_function(
@@ -97,5 +98,6 @@ async def rag_query_pdf_ai(ctx: inngest.Context):
     return {"answers":answer,"sources": cited_sources, "num_contexts": len(found.contexts)}
 app = FastAPI(lifespan=lifespan)
 app.include_router(ask_router)
+app.include_router(ingest_router)
 
 inngest.fast_api.serve(app,inngest_client,[rag_ingest_pdf, rag_query_pdf_ai])
