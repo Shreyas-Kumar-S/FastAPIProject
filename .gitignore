@@ -15,3 +15,6 @@ wheels/
 
 # Local Qdrant data
 qdrant_storage/
+
+# Runtime PDF uploads (POST /ingest)
+uploads/
