@@ -145,7 +145,7 @@ Today these are entirely Inngest's concern, not ours: `inngest.fast_api.serve`'s
 
 ## 8. API Design (Step 5) — implementation in progress (Step 6)
 
-**Status:** §8.2 (the `rag_service.py` module) is **✅ implemented** (Session 7, `feature/rag-service-extraction`, resolves F9) — see §12/§13 F9. `POST /ask` (§8.3) is **✅ implemented** (Session 8, `feature/ask-endpoint`) — see §12/§13 F5, F8. `POST /ingest` and `GET /ingest/{event_id}/status` are **still design-only**, next up per §19's branch stack.
+**Status:** §8.2 (the `rag_service.py` module) is **✅ implemented** (Session 7, `feature/rag-service-extraction`, resolves F9) — see §12/§13 F9. All three §8.3 endpoints are now **✅ implemented**: `POST /ask` (Session 8, `feature/ask-endpoint`, see §12/§13 F5/F8) and `POST /ingest` + `GET /ingest/{event_id}/status` (Session 9, `feature/ingest-endpoint`). Only `feature/api-tests` (broader endpoint test coverage, resolves F6) remains in §19's branch stack.
 
 **Chosen shape (user decision, Session 6):** mixed model — `/ask` is synchronous (calls the RAG pipeline directly, answers immediately); `/ingest` stays asynchronous via the existing Inngest event (`rag/ingest_pdf`), backed by a new status-polling endpoint. This was a genuine architectural fork with real trade-offs (see the three options offered) — recorded so a future reader understands *why* the two endpoints behave so differently, rather than assuming it's an inconsistency.
 
@@ -332,6 +332,8 @@ Documented for awareness; will be addressed opportunistically alongside related 
 | Feature | Added in | Summary |
 |---|---|---|
 | `POST /ask` | Session 8, branch `feature/ask-endpoint` | Synchronous REST endpoint per the §8.3 design: `AskRequest` (validated `question`/`top_k`/`score_threshold`), calls `rag_service.answer_question` (retrieval → empty-context short-circuit (F8) → prompt → direct Gemini call (Decision D5) → citation parsing), returns `QueryResult`. Registered via a new `src/fastapiproject/routers.py` `APIRouter` (§8.5), included into `app` in `main.py`. Maps Qdrant connection failures to `503`; validation failures are automatic `422`s from Pydantic. |
+| `POST /ingest` | Session 9, branch `feature/ingest-endpoint` | Multipart file upload per §8.3/D6: validates non-empty file list, `.pdf` extension + `application/pdf` content-type (`422` on either), ≤20MB per file (`413`). Each file's name is sanitized to its basename (`Path(file.filename).name`) and prefixed with `uuid4().hex` before saving under `PDF_UPLOAD_ROOT/uploads/`; the saved path is re-validated through F1's `resolve_safe_pdf_path` before being used (defense in depth). Sends the same `rag/ingest_pdf` event the existing Inngest function already consumes — `rag_ingest_pdf` itself is untouched. Returns `202` with `{event_id, status_url}`. |
+| `GET /ingest/{event_id}/status` | Session 9, branch `feature/ingest-endpoint` | Calls Inngest's own REST API (`GET {api_origin}v1/events/{event_id}/runs`, confirmed via Context7 in Session 6) using `httpx`. No-runs-yet → `200` `status: "Queued"` (not `404`) since a client polling immediately after `POST /ingest` may beat Inngest to creating the run. `Completed` → `ingested` populated from the run's `output`; `Failed` → `error` populated. Connection-level failures (`httpx.RequestError`) → `503`; a non-2xx response *from* Inngest → `502` (Decision D8 distinguishes these two cases, matching §8.4's status table). **The exact `output`/`error` field names on the run object are inferred from Inngest's docs/examples, not confirmed against a live response** — see D8 and §24. |
 
 ## 15. Tests
 
@@ -345,8 +347,9 @@ Documented for awareness; will be addressed opportunistically alongside related 
 | `tests/test_rag_service.py` | `rag_service.py` (F9 extraction; F5/F8/`/ask` additions), fully mocked (no real Gemini/Qdrant calls) | `load_and_chunk_sources` source_id defaulting/explicit/multi-PDF; `embed_and_upsert` deterministic ids + payload shape (async); `search_context` args/result shape (async); `build_prompt` numbering/question; `parse_cited_answer` extraction/empty-list/no-citation-line fallback; `generate_answer` calls Gemini via `client.aio.models.generate_content` and strips the response (async); `answer_question` short-circuits on empty context (F8) / builds prompt + parses citation on real context (async) | 12/12 passed |
 | `tests/test_vector_db.py` | `QdrantStorage`/`get_storage()`, mocked `AsyncQdrantClient` | singleton construct-once/reuse (unchanged); `upsert` creates collection when missing / skips when present / only checks existence once across calls; `search` returns context+sources from matched points | 6/6 passed |
 | `tests/test_ask_endpoint.py` | `POST /ask` end-to-end via `TestClient`, `rag_service.answer_question` mocked (auto-`AsyncMock`'d since the target is `async def`) | 200 with answer; custom `top_k`/`score_threshold` passed through; empty `question` → 422; `top_k` out of `[1,20]` bounds → 422; Qdrant `ApiException` → 503 | 5/5 passed |
+| `tests/test_ingest_endpoint.py` | `POST /ingest` + `GET /ingest/{event_id}/status` end-to-end via `TestClient`; `inngest_client.send` and `httpx.AsyncClient.get` mocked, `PDF_UPLOAD_ROOT` monkeypatched to `tmp_path` | empty file list → 422; wrong content-type → 422; oversized file → 413; valid upload saves bytes to disk + sends the correct event + returns 202 with `event_id`/`status_url`; path-traversal filename sanitized to its basename; status: no-runs → Queued/200; Completed → `ingested`; Failed → `error`; connection failure → 503; upstream error response → 502 | 10/10 passed |
 
-**Running total:** `uv run pytest -q` → 32/32 passed (Session 8).
+**Running total:** `uv run pytest -q` → 42/42 passed (Session 9).
 
 **Manual verification (Session 2):** `load_and_chunk_pdf('test.pdf')` re-run against the real sample file with the real Gemini API key loaded — succeeded (1 chunk extracted), confirming F1's fix didn't regress the already-working ingestion path. `load_and_chunk_pdf('../../test.pdf')` confirmed rejected.
 
@@ -358,7 +361,7 @@ Documented for awareness; will be addressed opportunistically alongside related 
 
 ## 16. Known Limitations (current, as-is)
 
-- `POST /ask` is implemented (Session 8); `POST /ingest` and `GET /ingest/{event_id}/status` are still design-only (§8), not yet implemented.
+- All three §8.3 endpoints are implemented (`POST /ask` Session 8; `POST /ingest`/`GET /ingest/{event_id}/status` Session 9). The status endpoint's run-object field parsing (`output`/`error`) is unverified against a live Inngest server — see D8/§24.
 - No auth/rate limiting (still true after Step 5's design — not in scope; would be a Step 7+ concern).
 - No upload size limits on the *existing* Inngest-event ingestion path (Step 5's `/ingest` design closes this for the new endpoint specifically — see §8.3).
 - Streamlit dependency declared but unused.
@@ -423,6 +426,13 @@ Documented for awareness; will be addressed opportunistically alongside related 
 - Added `pytest-asyncio` as a dev dependency + `asyncio_mode = "auto"` in `pyproject.toml` — required for `async def test_...` functions to actually execute their bodies (verified this was broken before adding it: a bare `async def test_x(): raise AssertionError(...)` silently "passed" with only a `RuntimeWarning`, since nothing awaited the test coroutine).
 **Trade-off:** This is a wider-than-originally-scoped change for a branch whose stated purpose (§19) was "implement `POST /ask`" — it touches `vector_db.py`, `data_loader.py`, `rag_service.py`, and `main.py`'s existing (working, previously "no behavior change") Inngest closures. Accepted as the user's explicit call after reviewing the cost/benefit table. **Could not be verified end-to-end against real Qdrant or a real Gemini API key this session** — `localhost:6333` unreachable and no `GEMINI_API_KEY` set in this session's environment (same class of limitation as Session 4's Qdrant check). All behavior is verified via mocked tests only (32/32 passing); a live check is recommended before relying on this in a demo.
 
+### D8 — `inngest_client` extracted to its own module; `502` vs `503` split for `GET /ingest/{event_id}/status`
+**Question 1:** `routers.py` needs the `Inngest` client both to send the `rag/ingest_pdf` event (`POST /ingest`) and to build the status-check URL (`GET /ingest/{event_id}/status`). It previously lived only in `main.py`, which already imports `routers.py` to register `ask_router` — importing it back from `main.py` would be circular.
+**Decision:** Moved the `inngest.Inngest(...)` construction into a new `src/fastapiproject/inngest_client.py`; both `main.py` and `routers.py` now import `client` from there. `main.py`'s `inngest_client.create_function(...)` decorator usage and `inngest.fast_api.serve(app, inngest_client, ...)` call are otherwise unchanged (still referenced as `inngest_client` locally via `from fastapiproject.inngest_client import client as inngest_client`).
+**Question 2:** §8.3's error table lists both `502` and `503` for `GET /ingest/{event_id}/status` without specifying which failure maps to which.
+**Decision:** `503` for connection-level failures (`httpx.RequestError` — timeout, connection refused, DNS failure: Inngest's API isn't reachable at all); `502` for a response that *does* come back from Inngest but with a non-2xx status (Inngest itself reported an error). This matches §8.3's own reasoning ("distinguishes 'your ingestion failed' from 'we can't currently check'") by further splitting "can't check" into "couldn't even connect" (503) vs. "connected, but Inngest said no" (502).
+**Caveat (not a decision, a real gap):** the exact JSON field names inside each run object for `Completed`'s output and `Failed`'s error (`run.get("output")`/`run.get("error")` in `routers.ingest_status`) are **inferred from Inngest's documentation/example code, not confirmed against a live response** — no local Inngest Dev Server was reachable in Session 9 to verify. `run.get("status")` is confirmed (used directly in Inngest's own documented polling example). See §24 for the live-verification follow-up this implies.
+
 ## 18. Questions & Decisions
 
 Q&A log, chronological:
@@ -435,15 +445,15 @@ Q&A log, chronological:
 
 ## 19. Git Branching Strategy
 
-**Updated Session 8.** `fix/rag-pipeline-hardening` (F1, F3, F4, F5-partial, Step 4/5 docs) and `feature/rag-service-extraction` (F9) are done but not yet merged to `main` — no GitHub remote exists yet (Decision D2). `feature/ask-endpoint`, branched from the extraction branch, is also now done (`POST /ask`, F5-full via D7, F8). All still local-only stacked branches:
+**Updated Session 9.** `fix/rag-pipeline-hardening` (F1, F3, F4, F5-partial, Step 4/5 docs), `feature/rag-service-extraction` (F9), and `feature/ask-endpoint` (`POST /ask`, F5-full via D7, F8) are all done but not yet merged to `main` — no GitHub remote exists yet (Decision D2). `feature/ingest-endpoint`, branched from `feature/ask-endpoint`, is also now done (`POST /ingest`, `GET /ingest/{event_id}/status`, D8). All still local-only stacked branches:
 
 ```
 main
  └── fix/rag-pipeline-hardening          (done: F1, F3, F4, F5-partial, Step 4/5 docs — 6 commits)
       └── feature/rag-service-extraction (done: rag_service.py — F9, no behavior change — 1 commit)
-           └── feature/ask-endpoint      (done: POST /ask, F5-full async conversion (D7), F8 — this session)
-                └── feature/ingest-endpoint (next: POST /ingest + status, depends on rag_service)
-                     └── feature/api-tests   (endpoint test coverage for all three)
+           └── feature/ask-endpoint      (done: POST /ask, F5-full async conversion (D7), F8 — 7 commits)
+                └── feature/ingest-endpoint (done: POST /ingest + status, D8 — this session)
+                     └── feature/api-tests   (next: broader endpoint test coverage, resolves F6)
 ```
 
 `feature/rag-service-extraction` is the base of the stack (not `feature/fastapi-foundation` as originally sketched in Session 1 — that name predated the actual design; the real first step is the extraction, since both new endpoints and the untouched Inngest functions depend on it).
@@ -540,6 +550,17 @@ main
 - **Could not verify live:** neither `localhost:6333` (Qdrant) nor a real `GEMINI_API_KEY` was available in this session — same class of gap Session 4 hit for the partial F5 fix. `main.py` confirmed to import cleanly and register `/ask` correctly; all behavior otherwise verified via mocks only. Flagged in §24, not silently skipped.
 - **Next:** `feature/ingest-endpoint` (`POST /ingest` + `GET /ingest/{event_id}/status`, per §19's branch stack), or a live smoke test of `/ask`/the Inngest functions against a running Qdrant + real Gemini key first — user's call.
 
+### Session 9 — 2026-08-16
+- Branched `feature/ingest-endpoint` off `feature/ask-endpoint`.
+- Looked up the exact Inngest REST API shape for the status endpoint via Context7 (`GET {api_origin}v1/events/{event_id}/runs` returns `{"data": [...]}`, each run has a `status` field with documented values `Queued`/`Running`/`Completed`/`Failed`/`Cancelled`); could not find an authoritative schema for the run object's output/error field names specifically (see D8's caveat) and no live Inngest Dev Server was reachable to check empirically, so `output`/`error` field access is a documented, flagged assumption rather than a confirmed fact.
+- **Decision D8:** extracted `inngest.Inngest(...)` construction out of `main.py` into a new `src/fastapiproject/inngest_client.py` to avoid a circular import (`routers.py` now needs the client too, and `main.py` already imports `routers.py`). Also decided the `502`/`503` split for the status endpoint's error mapping. Full writeup in §17.
+- **Implemented `POST /ingest`** via TDD: validates non-empty file list / `.pdf` extension + `application/pdf` content-type / ≤20MB size; sanitizes each filename to its basename and prefixes with `uuid4().hex` before saving under `PDF_UPLOAD_ROOT/uploads/`; re-validates the saved path through F1's `resolve_safe_pdf_path` (belt-and-suspenders, per §8.3); sends the existing `rag/ingest_pdf` event via `inngest_client.send(...)` — `rag_ingest_pdf` itself is untouched; returns `202` with `{event_id, status_url}`.
+- **Implemented `GET /ingest/{event_id}/status`** via TDD: calls Inngest's REST API with `httpx`, maps no-runs-yet to `200`/`Queued` (not `404`, per §8.3's documented reasoning), `Completed`/`Failed` to `ingested`/`error`, connection failures to `503`, non-2xx upstream responses to `502` (D8).
+- Added `IngestResponse`/`IngestStatusResponse` to `custom_types.py`; added `httpx` as an explicit dependency (was previously only transitive via `qdrant-client`/Starlette's `TestClient`); added `uploads/` to `.gitignore` (runtime data, same reasoning as `qdrant_storage/` in the Session 1 baseline commit); wired `ensure_upload_dir()` into the FastAPI `lifespan` alongside the existing F4 env-var check, per §8.3's documented design — verified with a throwaway `TestClient` run against a temp `PDF_UPLOAD_ROOT` that the `uploads/` directory actually gets created on startup.
+- **Tests run:** `uv run pytest -q` → 42/42 passed (10 new in `tests/test_ingest_endpoint.py`, covering both endpoints end-to-end via `TestClient` with `inngest_client.send`/`httpx.AsyncClient.get` mocked and `PDF_UPLOAD_ROOT` monkeypatched to `tmp_path` for filesystem isolation). Confirmed via `main.app.openapi()['paths']` that all four routes (`/ask`, `/ingest`, `/ingest/{event_id}/status`, `/api/inngest`) register correctly.
+- **Could not verify live:** neither a local Inngest Dev Server (`127.0.0.1:8288`) nor Qdrant (`localhost:6333`) was reachable this session — same class of gap as Sessions 4 and 8. The status endpoint's run-object field assumption (D8) specifically needs a live check before this is demo-ready; flagged in §24, not silently assumed correct.
+- **Next:** `feature/api-tests` (broader endpoint test coverage, resolves F6) is the last item in §19's branch stack — or a live smoke test of all three endpoints against a running Inngest Dev Server + Qdrant + real Gemini key first, to close out the verification gaps from Sessions 4/8/9 in one pass. User's call.
+
 ## 23. Before/After Architecture
 
 *(populated as changes land — none yet)*
@@ -548,7 +569,9 @@ main
 
 Tracks 1:1 with open items in §12 until each is fixed and moved to §13.
 
-**D4's trigger condition fired and was resolved in Session 8** — see Decision D7. The `AsyncQdrantClient`/async-Gemini conversion is done, but **not yet verified against a live Qdrant instance or a real Gemini API key** (neither was reachable/configured this session). Recommend a live smoke test of `/ask` (and the still-sync-but-now-calling-async-code Inngest functions) before relying on this in a demo — this is the same class of gap Session 4 left open for F5's partial fix, now inherited by the full fix.
+**D4's trigger condition fired and was resolved in Session 8** — see Decision D7. The `AsyncQdrantClient`/async-Gemini conversion is done, but **not yet verified against a live Qdrant instance or a real Gemini API key** (neither was reachable/configured that session, and still isn't as of Session 9). Recommend a live smoke test of `/ask` (and the still-sync-but-now-calling-async-code Inngest functions) before relying on this in a demo — this is the same class of gap Session 4 left open for F5's partial fix, now inherited by the full fix.
+
+**Session 9 addition:** `GET /ingest/{event_id}/status`'s parsing of the run object's `output`/`error` fields (see D8) is based on Inngest's documentation and example code, not a live response — no local Inngest Dev Server was reachable this session either. Before relying on this endpoint in a demo, run `POST /ingest` against a real Inngest Dev Server + Qdrant, then poll `GET /ingest/{event_id}/status` and confirm the actual run JSON matches what `routers.ingest_status` expects (`status`, `output.ingested`, `error`) — adjust the field lookups if the real shape differs.
 
 ## 25. Recommended Next Steps
 
