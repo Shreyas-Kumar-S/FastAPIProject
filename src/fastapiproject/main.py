@@ -13,6 +13,7 @@ import os
 import datetime
 from fastapiproject import rag_service
 from fastapiproject.custom_types import PdfRef,RagChunkAndSource,QueryResult,RagSearchResult,RagUpsertResult
+from fastapiproject.inngest_client import client as inngest_client
 from fastapiproject.routers import ask_router
 
 load_dotenv()
@@ -32,13 +33,6 @@ def _validate_required_env_vars() -> None:
 async def lifespan(app: FastAPI):
     _validate_required_env_vars()
     yield
-
-inngest_client = inngest.Inngest(
-    app_id="rag_app",
-    logger=logging.getLogger("uvicorn"),
-    is_production=False,
-    serializer=inngest.PydanticSerializer()
-)
 
 @inngest_client.create_function(
     fn_id="rag-ingest-pdf",
@@ -76,7 +70,6 @@ async def rag_query_pdf_ai(ctx: inngest.Context):
     found = await ctx.step.run("searching", lambda : _search(question,top_k,score_threshold), output_type=RagSearchResult)
 
     user_content = rag_service.build_prompt(question, found.contexts)
-
     adapter = gemini.Adapter(
         auth_key=os.environ["GEMINI_API_KEY"],
         model="gemini-3.6-flash"
