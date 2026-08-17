@@ -135,13 +135,19 @@ with upload_tab:
         except api_client.ApiError as exc:
             st.error(exc.detail)
         else:
-            st.markdown(f"Event ID: `{ingest_result.event_id}`")
+            st.session_state["ingest_event_id"] = ingest_result.event_id
+            st.session_state["ingest_status"] = None
 
+    event_id = st.session_state.get("ingest_event_id")
+    if event_id:
+        st.markdown(f"Event ID: `{event_id}`")
+
+        status = st.session_state.get("ingest_status")
+        if status is None or status.status not in ("Completed", "Failed"):
             with st.spinner("Ingesting..."):
-                status = None
                 for _ in range(20):
                     try:
-                        status = api_client.check_status(ingest_result.event_id)
+                        status = api_client.check_status(event_id)
                     except api_client.ApiError as exc:
                         st.error(exc.detail)
                         status = None
@@ -149,13 +155,15 @@ with upload_tab:
                     if status.status in ("Completed", "Failed"):
                         break
                     time.sleep(1.5)
+            st.session_state["ingest_status"] = status
 
-            if status is not None:
-                if status.status == "Completed":
-                    st.success(f"Ingested {status.ingested} chunks.")
-                elif status.status == "Failed":
-                    st.error(status.error)
-                else:
-                    st.info(f"Still {status.status.lower()}...")
-                    if st.button("Check again", key="check_again_button"):
-                        st.rerun()
+        if status is not None:
+            if status.status == "Completed":
+                st.success(f"Ingested {status.ingested} chunks.")
+            elif status.status == "Failed":
+                st.error(status.error)
+            else:
+                st.info(f"Still {status.status.lower()}...")
+                if st.button("Check again", key="check_again_button"):
+                    st.session_state["ingest_status"] = None
+                    st.rerun()
