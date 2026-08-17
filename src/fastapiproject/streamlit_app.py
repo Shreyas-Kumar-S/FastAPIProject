@@ -1,4 +1,5 @@
 import html
+import time
 
 import streamlit as st
 
@@ -123,3 +124,38 @@ with ask_tab:
         else:
             st.write(result.answers)
             render_citation_chips(result.sources)
+
+with upload_tab:
+    uploaded_files = st.file_uploader("PDFs", accept_multiple_files=True, type=["pdf"])
+
+    if st.button("Upload", key="upload_button") and uploaded_files:
+        files = [(f.name, f.getvalue()) for f in uploaded_files]
+        try:
+            ingest_result = api_client.ingest(files)
+        except api_client.ApiError as exc:
+            st.error(exc.detail)
+        else:
+            st.markdown(f"Event ID: `{ingest_result.event_id}`")
+
+            with st.spinner("Ingesting..."):
+                status = None
+                for _ in range(20):
+                    try:
+                        status = api_client.check_status(ingest_result.event_id)
+                    except api_client.ApiError as exc:
+                        st.error(exc.detail)
+                        status = None
+                        break
+                    if status.status in ("Completed", "Failed"):
+                        break
+                    time.sleep(1.5)
+
+            if status is not None:
+                if status.status == "Completed":
+                    st.success(f"Ingested {status.ingested} chunks.")
+                elif status.status == "Failed":
+                    st.error(status.error)
+                else:
+                    st.info(f"Still {status.status.lower()}...")
+                    if st.button("Check again", key="check_again_button"):
+                        st.rerun()
