@@ -16,6 +16,7 @@ class ApiError(Exception):
 
 def _request(method: str, path: str, **kwargs) -> httpx.Response:
     url = f"{BACKEND_URL}{path}"
+    kwargs.setdefault("timeout", 120)
     try:
         response = httpx.request(method, url, **kwargs)
     except httpx.RequestError as exc:
