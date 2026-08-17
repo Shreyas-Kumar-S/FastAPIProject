@@ -293,33 +293,166 @@ git commit -m "feat: add api_client.check_status()"
 
 ---
 
-### Task 4: `streamlit_app.py` — Ask tab
+### Task 4: Visual design system + page shell
 
 **Files:**
 - Create: `src/fastapiproject/streamlit_app.py`
 
 **Interfaces:**
-- Consumes: `api_client.ask(question, top_k, score_threshold) -> QueryResult`, `api_client.ApiError`
+- Produces: `ask_tab`, `upload_tab` — the two `st.tabs(...)` context managers Tasks 5/6 write their `with ask_tab:` / `with upload_tab:` blocks into
+- Produces: `render_citation_chips(sources: list[str]) -> None` — renders the signature citation-chip row, HTML-escaping each source string
 
 - [ ] **Step 1: Write the implementation**
 
 Create `src/fastapiproject/streamlit_app.py`:
 
 ```python
+import html
+
 import streamlit as st
 
 from fastapiproject import api_client
 
-st.set_page_config(page_title="RAG PDF Assistant", page_icon="📄")
+st.set_page_config(page_title="RAG PDF Assistant", page_icon="📄", layout="wide")
+
+st.markdown(
+    """
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap');
+
+    :root {
+        --paper: #E9ECE7;
+        --surface: #FFFFFF;
+        --ink: #1B2420;
+        --ink-muted: #5B6560;
+        --accent: #1F5C52;
+        --citation: #8C3B2E;
+        --rule: #C7CFC9;
+    }
+
+    html, body, [class*="css"] {
+        font-family: 'IBM Plex Sans', sans-serif;
+        color: var(--ink);
+    }
+
+    .stApp {
+        background-color: var(--paper);
+    }
+
+    .block-container {
+        max-width: 880px;
+        padding-top: 2.5rem;
+    }
+
+    h1, h2, h3 {
+        font-family: 'Source Serif 4', serif;
+        color: var(--ink);
+    }
+
+    .stMarkdown p {
+        font-family: 'Source Serif 4', serif;
+    }
+
+    .stButton > button {
+        background-color: var(--accent);
+        color: var(--surface);
+        border: none;
+        border-radius: 4px;
+        font-family: 'IBM Plex Sans', sans-serif;
+        font-weight: 500;
+    }
+
+    .stButton > button:hover {
+        background-color: #164941;
+        color: var(--surface);
+    }
+
+    *:focus-visible {
+        outline: 2px solid var(--accent);
+        outline-offset: 2px;
+    }
+
+    .stTabs [aria-selected="true"] {
+        color: var(--accent) !important;
+        border-bottom-color: var(--accent) !important;
+    }
+
+    .stTabs [data-baseweb="tab"] {
+        font-family: 'IBM Plex Sans', sans-serif;
+    }
+
+    .citation-chip-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.5rem;
+        margin-top: 0.75rem;
+    }
+
+    .citation-chip {
+        background-color: var(--surface);
+        border: 1px solid var(--rule);
+        border-left: 3px solid var(--citation);
+        border-radius: 3px;
+        padding: 0.35rem 0.6rem;
+        font-family: 'IBM Plex Mono', monospace;
+        font-size: 0.85rem;
+        color: var(--ink-muted);
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.title("RAG PDF Assistant")
 
-ask_tab, upload_tab = st.tabs(["Ask a Question", "Upload PDFs"])
 
+def render_citation_chips(sources: list[str]) -> None:
+    if not sources:
+        return
+    chips = "".join(f'<span class="citation-chip">{html.escape(s)}</span>' for s in sources)
+    st.markdown(f'<div class="citation-chip-row">{chips}</div>', unsafe_allow_html=True)
+
+
+ask_tab, upload_tab = st.tabs(["Ask a Question", "Upload PDFs"])
+```
+
+- [ ] **Step 2: Manually verify in the browser**
+
+```bash
+uv run streamlit run src/fastapiproject/streamlit_app.py
+```
+
+Confirm in the opened browser tab: the page background is a cool sage-gray (not Streamlit's default white), the title renders in a serif face, the content column doesn't stretch full-bleed on a wide monitor, and there are two empty tabs ("Ask a Question", "Upload PDFs") with no console errors in the browser dev tools.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add src/fastapiproject/streamlit_app.py
+git commit -m "feat: add Streamlit page shell with visual design system"
+```
+
+---
+
+### Task 5: `streamlit_app.py` — Ask tab
+
+**Files:**
+- Modify: `src/fastapiproject/streamlit_app.py`
+
+**Interfaces:**
+- Consumes: `api_client.ask(question, top_k, score_threshold) -> QueryResult`, `api_client.ApiError` (Tasks 1–3); `render_citation_chips(sources)` (Task 4)
+
+- [ ] **Step 1: Write the implementation**
+
+Append, indented inside the `with ask_tab:` block (add this at the end of the file, after the `ask_tab, upload_tab = st.tabs(...)` line from Task 4):
+
+```python
 with ask_tab:
     question = st.text_input("Question")
 
-    with st.expander("Advanced"):
+    col1, col2 = st.columns(2)
+    with col1:
         top_k = st.slider("Top K", 1, 20, value=5)
+    with col2:
         score_threshold = st.slider("Score threshold", 0.0, 1.0, value=0.5, step=0.05)
 
     if st.button("Ask", key="ask_button") and question:
@@ -329,23 +462,16 @@ with ask_tab:
             st.error(exc.detail)
         else:
             st.write(result.answers)
-            if result.sources:
-                with st.expander(f"Sources ({result.num_contexts} context chunks)"):
-                    for source in result.sources:
-                        st.write(f"- {source}")
+            render_citation_chips(result.sources)
 ```
 
 - [ ] **Step 2: Manually verify in the browser**
 
-With the FastAPI backend running (`uv run uvicorn fastapiproject.main:app --reload`) and a real `GEMINI_API_KEY`/Qdrant available, run:
-
-```bash
-uv run streamlit run src/fastapiproject/streamlit_app.py
-```
+With the FastAPI backend running (`uv run uvicorn fastapiproject.main:app --reload`) and a real `GEMINI_API_KEY`/Qdrant available, restart `streamlit run src/fastapiproject/streamlit_app.py` to pick up the change.
 
 In the opened browser tab:
-1. Confirm the "Ask a Question" tab renders with a text input, an "Advanced" expander containing two sliders, and an "Ask" button.
-2. Type a question and click "Ask" — confirm an answer renders, and (if sources exist) a "Sources" expander lists them.
+1. Confirm the "Ask a Question" tab renders a text input, two side-by-side sliders (Top K, Score threshold — stacked instead of side-by-side if you narrow the browser window, confirming the responsive column behavior), and an accent-teal "Ask" button (not Streamlit's default red).
+2. Type a question and click "Ask" — confirm the answer renders in serif type, and (if sources exist) a row of citation chips appears below it — white cards with a brick-red left border and monospace filenames, wrapping to a new line if the window is narrow.
 3. Stop the `uvicorn` process, click "Ask" again — confirm `st.error` shows a "Could not reach the backend" message rather than a raw traceback. Restart `uvicorn` afterward.
 
 - [ ] **Step 3: Commit**
@@ -357,23 +483,23 @@ git commit -m "feat: add Streamlit Ask tab"
 
 ---
 
-### Task 5: `streamlit_app.py` — Upload tab with status polling
+### Task 6: `streamlit_app.py` — Upload tab with status polling
 
 **Files:**
 - Modify: `src/fastapiproject/streamlit_app.py`
 
 **Interfaces:**
-- Consumes: `api_client.ingest(files) -> IngestResponse`, `api_client.check_status(event_id) -> IngestStatusResponse`, `api_client.ApiError`
+- Consumes: `api_client.ingest(files) -> IngestResponse`, `api_client.check_status(event_id) -> IngestStatusResponse`, `api_client.ApiError` (Tasks 1–3)
 
 - [ ] **Step 1: Write the implementation**
 
-Add to `src/fastapiproject/streamlit_app.py` (add `import time` at the top of the file, alongside the existing `import streamlit as st`):
+Add `import time` at the top of `src/fastapiproject/streamlit_app.py`, alongside the existing `import html`:
 
 ```python
 import time
 ```
 
-Append inside the `with upload_tab:` block (add this after the `ask_tab` block, at the same indentation level as `with ask_tab:`):
+Append at the end of the file, indented inside a new `with upload_tab:` block (same indentation level as the `with ask_tab:` block from Task 5):
 
 ```python
 with upload_tab:
@@ -386,7 +512,7 @@ with upload_tab:
         except api_client.ApiError as exc:
             st.error(exc.detail)
         else:
-            st.write(f"Event ID: `{ingest_result.event_id}`")
+            st.markdown(f"Event ID: `{ingest_result.event_id}`")
 
             with st.spinner("Ingesting..."):
                 status = None
@@ -416,10 +542,11 @@ with upload_tab:
 
 With `uvicorn` and `streamlit run` both still running (restart `streamlit run` to pick up the file change):
 
-1. Confirm the "Upload PDFs" tab renders a file uploader (PDF-only) and an "Upload" button.
-2. Upload a real PDF (e.g. `test.pdf` from the project root) and click "Upload" — confirm the event ID appears, a spinner runs, and it resolves to "Ingested N chunks."
-3. Switch to the "Ask a Question" tab and ask something about the just-uploaded PDF — confirm the answer cites it (matches the manual verification already done in Session 10 via curl).
+1. Confirm the "Upload PDFs" tab renders a file uploader (PDF-only) and an accent-teal "Upload" button, consistent with the Ask tab's styling.
+2. Upload a real PDF (e.g. `test.pdf` from the project root) and click "Upload" — confirm the event ID appears in monospace, a spinner runs, and it resolves to "Ingested N chunks."
+3. Switch to the "Ask a Question" tab and ask something about the just-uploaded PDF — confirm the answer cites it as a citation chip (matches the manual verification already done in Session 10 via curl).
 4. Upload a non-PDF file if the uploader allows it, or a file above 20MB, and confirm `st.error` shows the backend's validation message rather than a raw traceback.
+5. Resize the browser window narrow (mobile width) — confirm the tabs, file uploader, and any citation chips reflow to a single column without any element overflowing horizontally.
 
 - [ ] **Step 3: Commit**
 
@@ -430,7 +557,7 @@ git commit -m "feat: add Streamlit Upload tab with status polling"
 
 ---
 
-### Task 6: Document the frontend and finalize
+### Task 7: Document the frontend and finalize
 
 **Files:**
 - Modify: `FastAPIProject_Overview.md`
@@ -445,7 +572,7 @@ Expected: 55 passed
 
 - [ ] **Step 2: Update `FastAPIProject_Overview.md`**
 
-Add a row to the Features Added table (§14) for the Streamlit frontend, referencing `api_client.py`/`streamlit_app.py`, the `BACKEND_URL` env var, and the two run commands (`uv run uvicorn fastapiproject.main:app --reload` + `uv run streamlit run src/fastapiproject/streamlit_app.py`). Add a Session changelog entry (§22) summarizing the work, the manual verification performed in Task 4/5's Step 2, and noting Step 7 (GitHub remote, Decision D2) as the next milestone now that the frontend exists too. Update the "Streamlit dependency declared but unused" line in Known Limitations (§16) — it is no longer unused.
+Add a row to the Features Added table (§14) for the Streamlit frontend, referencing `api_client.py`/`streamlit_app.py`, the `BACKEND_URL` env var, the visual design system (spec §4.3), and the two run commands (`uv run uvicorn fastapiproject.main:app --reload` + `uv run streamlit run src/fastapiproject/streamlit_app.py`). Add a Session changelog entry (§22) summarizing the work, the manual verification performed in Tasks 4/5/6's Step 2, and noting Step 7 (GitHub remote, Decision D2) as the next milestone now that the frontend exists too. Update the "Streamlit dependency declared but unused" line in Known Limitations (§16) — it is no longer unused.
 
 - [ ] **Step 3: Commit**
 
