@@ -137,13 +137,16 @@ with upload_tab:
         else:
             st.session_state["ingest_event_id"] = ingest_result.event_id
             st.session_state["ingest_status"] = None
+            st.session_state["ingest_poll_requested"] = True
 
     event_id = st.session_state.get("ingest_event_id")
     if event_id:
         st.markdown(f"Event ID: `{event_id}`")
 
         status = st.session_state.get("ingest_status")
-        if status is None or status.status not in ("Completed", "Failed"):
+
+        if st.session_state.get("ingest_poll_requested"):
+            st.session_state["ingest_poll_requested"] = False
             with st.spinner("Ingesting..."):
                 for _ in range(20):
                     try:
@@ -161,9 +164,9 @@ with upload_tab:
             if status.status == "Completed":
                 st.success(f"Ingested {status.ingested} chunks.")
             elif status.status == "Failed":
-                st.error(status.error)
+                st.error(status.error or "Ingestion failed (no details returned).")
             else:
                 st.info(f"Still {status.status.lower()}...")
                 if st.button("Check again", key="check_again_button"):
-                    st.session_state["ingest_status"] = None
+                    st.session_state["ingest_poll_requested"] = True
                     st.rerun()

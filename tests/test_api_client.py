@@ -23,6 +23,7 @@ def test_ask_returns_parsed_query_result():
         f"{api_client.BACKEND_URL}/ask",
         json={"question": "what is x?", "top_k": 3, "score_threshold": 0.4},
         timeout=120,
+        follow_redirects=True,
     )
 
 
@@ -57,6 +58,7 @@ def test_ingest_sends_multipart_files_and_returns_parsed_response():
         f"{api_client.BACKEND_URL}/ingest",
         files=[("files", ("doc.pdf", b"%PDF-1.4 hello", "application/pdf"))],
         timeout=120,
+        follow_redirects=True,
     )
 
 
@@ -83,5 +85,8 @@ def test_check_status_returns_parsed_status():
 
     assert result == IngestStatusResponse(event_id="evt_1", status="Completed", ingested=5, error=None)
     mock_request.assert_called_once_with(
-        "GET", f"{api_client.BACKEND_URL}/ingest/evt_1/status", timeout=120
+        "GET",
+        f"{api_client.BACKEND_URL}/ingest/evt_1/status",
+        timeout=120,
+        follow_redirects=True,
     )

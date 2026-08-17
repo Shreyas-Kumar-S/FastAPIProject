@@ -1,8 +1,11 @@
 import os
 
 import httpx
+from dotenv import load_dotenv
 
 from fastapiproject.custom_types import IngestResponse, IngestStatusResponse, QueryResult
+
+load_dotenv()
 
 BACKEND_URL = os.environ.get("BACKEND_URL", "http://127.0.0.1:8000")
 
@@ -17,6 +20,7 @@ class ApiError(Exception):
 def _request(method: str, path: str, **kwargs) -> httpx.Response:
     url = f"{BACKEND_URL}{path}"
     kwargs.setdefault("timeout", 120)
+    kwargs.setdefault("follow_redirects", True)
     try:
         response = httpx.request(method, url, **kwargs)
     except httpx.RequestError as exc:
@@ -27,6 +31,8 @@ def _request(method: str, path: str, **kwargs) -> httpx.Response:
             detail = response.json().get("detail", response.text)
         except ValueError:
             detail = response.text
+        if not isinstance(detail, str):
+            detail = str(detail)
         raise ApiError(response.status_code, detail)
 
     return response
