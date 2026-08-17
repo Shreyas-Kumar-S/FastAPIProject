@@ -58,6 +58,32 @@ A small `ApiError(Exception)` class with two attributes — `status_code: int | 
 - Polling: inside `st.spinner("Ingesting...")`, loop calling `api_client.check_status(event_id)` every ~1.5s, up to ~20 iterations (~30s total). Stops early on `status in ("Completed", "Failed")`. On `Completed`, shows the `ingested` chunk count; on `Failed`, shows the `error` via `st.error`. If still `Queued`/`Running` after the timeout, stops polling and shows a manual "Check again" button (`st.button`) that re-runs one status check on click — avoids blocking the Streamlit process indefinitely.
 - On `ApiError` from the initial `ingest` call (422/413/500): `st.error(...)` with the backend's `detail`, no polling starts.
 
+### 4.3 Visual design
+
+The default Streamlit look (system-ui font, bright red active-tab/button accents, full-bleed unbounded width) reads as an unstyled prototype. This gets a real, deliberate visual identity instead of that default — applied once, as a shared CSS foundation both tabs consume, not improvised per-tab.
+
+**Grounding:** the subject is a *grounded, evidence-based* research tool — every answer traces back to specific source chunks. The design leans into that: an archival, index-card/ledger feel (citations as physical evidence, not a generic bullet list) rather than a generic SaaS-chatbot look. Deliberately avoiding the current AI-generated-design defaults: not the warm-cream-serif-terracotta look, not black-with-neon-accent, not zero-radius broadsheet columns.
+
+**Color** (named hex):
+- `--paper: #E9ECE7` — page background, a cool sage-gray (not warm cream)
+- `--surface: #FFFFFF` — card/container surfaces, pure white for contrast against the sage background
+- `--ink: #1B2420` — primary text, near-black with a green-black cast
+- `--ink-muted: #5B6560` — secondary text (labels, captions, hints)
+- `--accent: #1F5C52` — primary accent: buttons, active tab underline, focus rings, links (deep teal-pine, not the default Streamlit red, not a generic SaaS blue/purple)
+- `--citation: #8C3B2E` — used *only* for citation-chip accents (muted brick-red, evokes archive-stamp ink) — the one deliberately bold color in the palette, spent entirely on the signature element
+- `--rule: #C7CFC9` — hairline borders/dividers
+
+**Type** (2 Google Fonts, loaded via `@import` in the injected CSS):
+- **Source Serif 4** — the app title and the rendered answer text. A reading-oriented serif, since the core interaction is reading a synthesized answer.
+- **IBM Plex Sans** — all UI chrome: labels, buttons, tab labels, inputs.
+- **IBM Plex Mono** — citation filenames, event IDs, status values — anything that is literal data rather than prose, set in mono to signal "this is a fact, not a sentence."
+
+**Layout:** `st.set_page_config(layout="wide")` plus a CSS max-width (880px) centered content column via a `.block-container` override — full-bleed on nothing, comfortable reading measure on a wide monitor, and naturally single-column on mobile once the viewport drops below the max-width (no separate mobile layout needed for the main column). `st.columns` (used for the two Advanced sliders) collapse to stacked automatically on narrow viewports — this is Streamlit's built-in responsive behavior, not something built by hand.
+
+**Signature element — citation chips:** cited sources render as small tags below the answer, not a plain bulleted list: white surface, a `1px solid var(--rule)` border, a `3px solid var(--citation)` left accent bar, the filename in `IBM Plex Mono`, laid out in a `flex-wrap` row so they naturally reflow to multiple lines on narrow screens with zero media-query code. This is the one place the brick-red accent appears, making it a deliberate signature rather than decoration.
+
+**Quality floor:** visible keyboard focus on buttons/inputs (`:focus-visible` outline in `--accent`), no motion beyond Streamlit's own built-in transitions (no added animation — restraint, not a page-load sequence, fits a utility tool), and the chip row's `flex-wrap` is the only "responsive" mechanism that needed hand-written CSS — everything else responsive comes from Streamlit's own layout primitives (`layout="wide"`, `st.columns`, `st.tabs`).
+
 ## 5. Data flow
 
 ```
