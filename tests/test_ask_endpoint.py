@@ -52,3 +52,18 @@ def test_ask_maps_qdrant_unreachable_to_503(client):
         response = client.post("/ask", json={"question": "q"})
 
     assert response.status_code == 503
+
+
+def test_ask_rejects_score_threshold_out_of_bounds(client):
+    response = client.post("/ask", json={"question": "q", "score_threshold": 1.5})
+
+    assert response.status_code == 422
+
+
+def test_ask_returns_500_on_unexpected_error(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "fake-key-for-test")
+    with TestClient(main.app, raise_server_exceptions=False) as no_raise_client:
+        with patch.object(rag_service, "answer_question", side_effect=RuntimeError("boom")):
+            response = no_raise_client.post("/ask", json={"question": "q"})
+
+    assert response.status_code == 500

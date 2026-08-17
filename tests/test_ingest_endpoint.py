@@ -66,6 +66,42 @@ def test_ingest_sanitizes_path_traversal_in_filename(client, tmp_path):
     assert not (tmp_path / "evil.pdf").exists()
 
 
+def test_ingest_accepts_multiple_files_in_one_request(client, tmp_path):
+    with patch.object(inngest_client, "send", AsyncMock(return_value=["evt_multi"])) as mock_send:
+        response = client.post(
+            "/ingest",
+            files=[
+                ("files", ("a.pdf", io.BytesIO(b"%PDF-1.4 a"), "application/pdf")),
+                ("files", ("b.pdf", io.BytesIO(b"%PDF-1.4 b"), "application/pdf")),
+            ],
+        )
+
+    assert response.status_code == 202
+    event = mock_send.call_args.args[0]
+    assert [pdf["source_id"] for pdf in event.data["pdfs"]] == ["a.pdf", "b.pdf"]
+
+    saved_files = list((tmp_path / "uploads").iterdir())
+    assert len(saved_files) == 2
+
+
+def test_ingest_rejects_file_with_no_filename(client):
+    response = client.post("/ingest", files={"files": ("", io.BytesIO(b"%PDF-1.4"), "application/pdf")})
+
+    assert response.status_code == 422
+
+
+def test_ingest_returns_500_when_inngest_send_fails(monkeypatch, tmp_path):
+    monkeypatch.setenv("GEMINI_API_KEY", "fake-key-for-test")
+    monkeypatch.setattr(data_loader, "PDF_UPLOAD_ROOT", tmp_path)
+    with TestClient(main.app, raise_server_exceptions=False) as no_raise_client:
+        with patch.object(inngest_client, "send", AsyncMock(side_effect=RuntimeError("boom"))):
+            response = no_raise_client.post(
+                "/ingest", files={"files": ("doc.pdf", io.BytesIO(b"%PDF-1.4"), "application/pdf")}
+            )
+
+    assert response.status_code == 500
+
+
 def test_status_returns_queued_when_no_runs_yet(client):
     fake_response = httpx.Response(200, json={"data": []})
     with patch("httpx.AsyncClient.get", AsyncMock(return_value=fake_response)):
