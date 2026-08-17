@@ -2,7 +2,7 @@ import os
 
 import httpx
 
-from fastapiproject.custom_types import IngestResponse, QueryResult
+from fastapiproject.custom_types import IngestResponse, IngestStatusResponse, QueryResult
 
 BACKEND_URL = os.environ.get("BACKEND_URL", "http://127.0.0.1:8000")
 
@@ -44,3 +44,8 @@ def ingest(files: list[tuple[str, bytes]]) -> IngestResponse:
     multipart_files = [("files", (name, content, "application/pdf")) for name, content in files]
     response = _request("POST", "/ingest", files=multipart_files)
     return IngestResponse(**response.json())
+
+
+def check_status(event_id: str) -> IngestStatusResponse:
+    response = _request("GET", f"/ingest/{event_id}/status")
+    return IngestStatusResponse(**response.json())

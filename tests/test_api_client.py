@@ -4,7 +4,7 @@ import httpx
 import pytest
 
 from fastapiproject import api_client
-from fastapiproject.custom_types import IngestResponse, QueryResult
+from fastapiproject.custom_types import IngestResponse, IngestStatusResponse, QueryResult
 
 
 def _fake_response(status_code, json_body):
@@ -69,3 +69,15 @@ def test_ingest_sends_multiple_files_as_repeated_form_field():
         ("files", ("a.pdf", b"a-bytes", "application/pdf")),
         ("files", ("b.pdf", b"b-bytes", "application/pdf")),
     ]
+
+
+def test_check_status_returns_parsed_status():
+    fake = _fake_response(
+        200, {"event_id": "evt_1", "status": "Completed", "ingested": 5, "error": None}
+    )
+
+    with patch("httpx.request", return_value=fake) as mock_request:
+        result = api_client.check_status("evt_1")
+
+    assert result == IngestStatusResponse(event_id="evt_1", status="Completed", ingested=5, error=None)
+    mock_request.assert_called_once_with("GET", f"{api_client.BACKEND_URL}/ingest/evt_1/status")
