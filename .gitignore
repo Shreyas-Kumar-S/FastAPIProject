@@ -18,3 +18,6 @@ qdrant_storage/
 
 # Runtime PDF uploads (POST /ingest)
 uploads/
+
+# Isolated worktrees for subagent-driven-development plans
+.worktrees/
