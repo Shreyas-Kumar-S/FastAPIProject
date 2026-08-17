@@ -1,0 +1,107 @@
+import html
+
+import streamlit as st
+
+from fastapiproject import api_client
+
+st.set_page_config(page_title="RAG PDF Assistant", page_icon="📄", layout="wide")
+
+st.markdown(
+    """
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap');
+
+    :root {
+        --paper: #E9ECE7;
+        --surface: #FFFFFF;
+        --ink: #1B2420;
+        --ink-muted: #5B6560;
+        --accent: #1F5C52;
+        --citation: #8C3B2E;
+        --rule: #C7CFC9;
+    }
+
+    html, body, [class*="css"] {
+        font-family: 'IBM Plex Sans', sans-serif;
+        color: var(--ink);
+    }
+
+    .stApp {
+        background-color: var(--paper);
+    }
+
+    .block-container {
+        max-width: 880px;
+        padding-top: 2.5rem;
+    }
+
+    h1, h2, h3 {
+        font-family: 'Source Serif 4', serif;
+        color: var(--ink);
+    }
+
+    .stMarkdown p {
+        font-family: 'Source Serif 4', serif;
+    }
+
+    .stButton > button {
+        background-color: var(--accent);
+        color: var(--surface);
+        border: none;
+        border-radius: 4px;
+        font-family: 'IBM Plex Sans', sans-serif;
+        font-weight: 500;
+    }
+
+    .stButton > button:hover {
+        background-color: #164941;
+        color: var(--surface);
+    }
+
+    *:focus-visible {
+        outline: 2px solid var(--accent);
+        outline-offset: 2px;
+    }
+
+    .stTabs [aria-selected="true"] {
+        color: var(--accent) !important;
+        border-bottom-color: var(--accent) !important;
+    }
+
+    .stTabs [data-baseweb="tab"] {
+        font-family: 'IBM Plex Sans', sans-serif;
+    }
+
+    .citation-chip-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.5rem;
+        margin-top: 0.75rem;
+    }
+
+    .citation-chip {
+        background-color: var(--surface);
+        border: 1px solid var(--rule);
+        border-left: 3px solid var(--citation);
+        border-radius: 3px;
+        padding: 0.35rem 0.6rem;
+        font-family: 'IBM Plex Mono', monospace;
+        font-size: 0.85rem;
+        color: var(--ink-muted);
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.title("RAG PDF Assistant")
+
+
+def render_citation_chips(sources: list[str]) -> None:
+    if not sources:
+        return
+    chips = "".join(f'<span class="citation-chip">{html.escape(s)}</span>' for s in sources)
+    st.markdown(f'<div class="citation-chip-row">{chips}</div>', unsafe_allow_html=True)
+
+
+ask_tab, upload_tab = st.tabs(["Ask a Question", "Upload PDFs"])
