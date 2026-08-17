@@ -105,3 +105,21 @@ def render_citation_chips(sources: list[str]) -> None:
 
 
 ask_tab, upload_tab = st.tabs(["Ask a Question", "Upload PDFs"])
+
+with ask_tab:
+    question = st.text_input("Question")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        top_k = st.slider("Top K", 1, 20, value=5)
+    with col2:
+        score_threshold = st.slider("Score threshold", 0.0, 1.0, value=0.5, step=0.05)
+
+    if st.button("Ask", key="ask_button") and question:
+        try:
+            result = api_client.ask(question, top_k=top_k, score_threshold=score_threshold)
+        except api_client.ApiError as exc:
+            st.error(exc.detail)
+        else:
+            st.write(result.answers)
+            render_citation_chips(result.sources)
