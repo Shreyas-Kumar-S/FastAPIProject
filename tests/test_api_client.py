@@ -4,7 +4,7 @@ import httpx
 import pytest
 
 from fastapiproject import api_client
-from fastapiproject.custom_types import QueryResult
+from fastapiproject.custom_types import IngestResponse, QueryResult
 
 
 def _fake_response(status_code, json_body):
@@ -42,3 +42,30 @@ def test_ask_raises_api_error_with_none_status_on_connection_failure():
             api_client.ask("q")
 
     assert exc_info.value.status_code is None
+
+
+def test_ingest_sends_multipart_files_and_returns_parsed_response():
+    fake = _fake_response(202, {"event_id": "evt_1", "status_url": "/ingest/evt_1/status"})
+
+    with patch("httpx.request", return_value=fake) as mock_request:
+        result = api_client.ingest([("doc.pdf", b"%PDF-1.4 hello")])
+
+    assert result == IngestResponse(event_id="evt_1", status_url="/ingest/evt_1/status")
+    mock_request.assert_called_once_with(
+        "POST",
+        f"{api_client.BACKEND_URL}/ingest",
+        files=[("files", ("doc.pdf", b"%PDF-1.4 hello", "application/pdf"))],
+    )
+
+
+def test_ingest_sends_multiple_files_as_repeated_form_field():
+    fake = _fake_response(202, {"event_id": "evt_2", "status_url": "/ingest/evt_2/status"})
+
+    with patch("httpx.request", return_value=fake) as mock_request:
+        api_client.ingest([("a.pdf", b"a-bytes"), ("b.pdf", b"b-bytes")])
+
+    sent_files = mock_request.call_args.kwargs["files"]
+    assert sent_files == [
+        ("files", ("a.pdf", b"a-bytes", "application/pdf")),
+        ("files", ("b.pdf", b"b-bytes", "application/pdf")),
+    ]
