@@ -241,7 +241,7 @@ Given the app is about to grow past "everything in `main.py`," endpoints are gro
 | F3 | High | Correctness | ✅ Fixed (Session 3) — `embed_texts` result not checked for `None`/length mismatch before upsert |
 | F4 | High | Reliability | ✅ Fixed (Session 3) — `GEMINI_API_KEY` only validated at call time, not startup |
 | F5 | Medium | Performance | ✅ Fixed (Session 8) — singleton client (Session 4) + full `AsyncQdrantClient`/async-genai conversion (Session 8, see D7) |
-| F6 | Medium | Testing | Zero automated tests in the project |
+| F6 | Medium | Testing | ✅ Fixed (Session 11) — grew from zero tests (Session 1) to 49 passing across every module, including endpoint-level and cross-endpoint-wiring coverage for all three REST routes |
 | F7 | Low | Correctness | Query function's `fn_id="RAG: Query pdf"` and its trigger event `rag/ingest_pdf_ai` are misleading/inconsistent names (ingest vs query) |
 | F8 | Low | UX/Correctness | ✅ Fixed (Session 8) — resolved as a side effect of implementing `POST /ask`'s empty-context short-circuit (`rag_service.answer_question`). Only fixed on the new `/ask` path; the existing Inngest `rag_query_pdf_ai` function is untouched, per "no behavior change" |
 | F9 | Low | Maintainability | ✅ Fixed (Session 7) — Business logic (`_load`, `_upsert`, `_search`) is nested inside Inngest function bodies in `main.py` rather than a separate service/module layer |
@@ -326,6 +326,7 @@ Documented for awareness; will be addressed opportunistically alongside related 
 | F5 (full) | Session 8, branch `feature/ask-endpoint` | Converted `vector_db.QdrantStorage` to `AsyncQdrantClient`, `data_loader.embed_texts` to `client.aio.models.embed_content`, and `rag_service`'s `embed_and_upsert`/`search_context`/`generate_answer`/`answer_question` to `async def`. See F5 in §12 and Decision D7. |
 | F8 | Session 8, branch `feature/ask-endpoint` | `rag_service.answer_question` short-circuits with `NO_CONTEXT_ANSWER` when `search_context` returns no contexts, instead of sending an empty context block to Gemini. Only applies to the new `/ask` path. See F8 in §12. |
 | F9 | Session 7, branch `feature/rag-service-extraction` | Extracted `_load`/`_upsert`/`_search`/prompt-building/citation-parsing into new `rag_service.py`; `main.py`'s Inngest functions now call into it, no behavior change. See F9 in §12. |
+| F6 | Session 11, branch `feature/api-tests` | Added remaining endpoint edge-case coverage (`/ask` `score_threshold` bounds + unhandled-error 500; `/ingest` multi-file upload, missing-filename rejection, Inngest-send-failure 500) plus `tests/test_full_flow.py` — two cross-endpoint tests that exercise `/ask`'s full real call chain (router → `rag_service` → `vector_db`/`data_loader`) with only the true external clients (Qdrant, Gemini) mocked, unlike the per-endpoint tests which stub `rag_service.answer_question` directly. All new cases passed against the already-correct implementation — this closed a coverage gap, not a behavior bug. See F6 in §12. |
 
 ## 14. Features Added
 
@@ -346,10 +347,11 @@ Documented for awareness; will be addressed opportunistically alongside related 
 | `tests/test_main_startup.py` | `lifespan` startup validation (F4 fix), via `TestClient` + `monkeypatch` | app starts with `GEMINI_API_KEY` set; app raises `RuntimeError` at startup when it's unset | 2/2 passed |
 | `tests/test_rag_service.py` | `rag_service.py` (F9 extraction; F5/F8/`/ask` additions), fully mocked (no real Gemini/Qdrant calls) | `load_and_chunk_sources` source_id defaulting/explicit/multi-PDF; `embed_and_upsert` deterministic ids + payload shape (async); `search_context` args/result shape (async); `build_prompt` numbering/question; `parse_cited_answer` extraction/empty-list/no-citation-line fallback; `generate_answer` calls Gemini via `client.aio.models.generate_content` and strips the response (async); `answer_question` short-circuits on empty context (F8) / builds prompt + parses citation on real context (async) | 12/12 passed |
 | `tests/test_vector_db.py` | `QdrantStorage`/`get_storage()`, mocked `AsyncQdrantClient` | singleton construct-once/reuse (unchanged); `upsert` creates collection when missing / skips when present / only checks existence once across calls; `search` returns context+sources from matched points | 6/6 passed |
-| `tests/test_ask_endpoint.py` | `POST /ask` end-to-end via `TestClient`, `rag_service.answer_question` mocked (auto-`AsyncMock`'d since the target is `async def`) | 200 with answer; custom `top_k`/`score_threshold` passed through; empty `question` → 422; `top_k` out of `[1,20]` bounds → 422; Qdrant `ApiException` → 503 | 5/5 passed |
-| `tests/test_ingest_endpoint.py` | `POST /ingest` + `GET /ingest/{event_id}/status` end-to-end via `TestClient`; `inngest_client.send` and `httpx.AsyncClient.get` mocked, `PDF_UPLOAD_ROOT` monkeypatched to `tmp_path` | empty file list → 422; wrong content-type → 422; oversized file → 413; valid upload saves bytes to disk + sends the correct event + returns 202 with `event_id`/`status_url`; path-traversal filename sanitized to its basename; status: no-runs → Queued/200; Completed → `ingested`; Failed → `error`; connection failure → 503; upstream error response → 502 | 10/10 passed |
+| `tests/test_ask_endpoint.py` | `POST /ask` end-to-end via `TestClient`, `rag_service.answer_question` mocked (auto-`AsyncMock`'d since the target is `async def`) | 200 with answer; custom `top_k`/`score_threshold` passed through; empty `question` → 422; `top_k`/`score_threshold` out of bounds → 422; Qdrant `ApiException` → 503; unhandled error → 500 (via `TestClient(..., raise_server_exceptions=False)`) | 7/7 passed |
+| `tests/test_ingest_endpoint.py` | `POST /ingest` + `GET /ingest/{event_id}/status` end-to-end via `TestClient`; `inngest_client.send` and `httpx.AsyncClient.get` mocked, `PDF_UPLOAD_ROOT` monkeypatched to `tmp_path` | empty file list → 422; wrong content-type → 422; oversized file → 413; valid upload saves bytes to disk + sends the correct event + returns 202 with `event_id`/`status_url`; path-traversal filename sanitized to its basename; multiple files in one request all saved+sent; missing filename → 422; Inngest send failure → 500; status: no-runs → Queued/200; Completed → `ingested`; Failed → `error`; connection failure → 503; upstream error response → 502 | 13/13 passed |
+| `tests/test_full_flow.py` | `POST /ask`'s full real call chain (router → `rag_service` → `vector_db`/`data_loader`), only Qdrant's `AsyncQdrantClient` and Gemini's `client.aio.models` mocked — unlike `test_ask_endpoint.py`, which stubs `rag_service.answer_question` itself | full chain returns a grounded, cited answer; full chain reaches F8's empty-context short-circuit without ever calling Gemini's generation endpoint | 2/2 passed |
 
-**Running total:** `uv run pytest -q` → 42/42 passed (Session 9).
+**Running total:** `uv run pytest -q` → 49/49 passed (Session 11).
 
 **Manual verification (Session 2):** `load_and_chunk_pdf('test.pdf')` re-run against the real sample file with the real Gemini API key loaded — succeeded (1 chunk extracted), confirming F1's fix didn't regress the already-working ingestion path. `load_and_chunk_pdf('../../test.pdf')` confirmed rejected.
 
@@ -445,15 +447,15 @@ Q&A log, chronological:
 
 ## 19. Git Branching Strategy
 
-**Updated Session 9.** `fix/rag-pipeline-hardening` (F1, F3, F4, F5-partial, Step 4/5 docs), `feature/rag-service-extraction` (F9), and `feature/ask-endpoint` (`POST /ask`, F5-full via D7, F8) are all done but not yet merged to `main` — no GitHub remote exists yet (Decision D2). `feature/ingest-endpoint`, branched from `feature/ask-endpoint`, is also now done (`POST /ingest`, `GET /ingest/{event_id}/status`, D8). All still local-only stacked branches:
+**Updated Session 11 — the full planned branch stack is now done.** All branches below are local-only — no GitHub remote exists yet (Decision D2); Step 7 (GitHub) is the natural next milestone.
 
 ```
 main
  └── fix/rag-pipeline-hardening          (done: F1, F3, F4, F5-partial, Step 4/5 docs — 6 commits)
       └── feature/rag-service-extraction (done: rag_service.py — F9, no behavior change — 1 commit)
            └── feature/ask-endpoint      (done: POST /ask, F5-full async conversion (D7), F8 — 7 commits)
-                └── feature/ingest-endpoint (done: POST /ingest + status, D8 — this session)
-                     └── feature/api-tests   (next: broader endpoint test coverage, resolves F6)
+                └── feature/ingest-endpoint (done: POST /ingest + status, D8 — 4 commits + 1 live-verification docs commit)
+                     └── feature/api-tests   (done: F6, remaining edge-case + cross-endpoint coverage — this session)
 ```
 
 `feature/rag-service-extraction` is the base of the stack (not `feature/fastapi-foundation` as originally sketched in Session 1 — that name predated the actual design; the real first step is the extraction, since both new endpoints and the untouched Inngest functions depend on it).
@@ -560,6 +562,15 @@ main
 - **Tests run:** `uv run pytest -q` → 42/42 passed (10 new in `tests/test_ingest_endpoint.py`, covering both endpoints end-to-end via `TestClient` with `inngest_client.send`/`httpx.AsyncClient.get` mocked and `PDF_UPLOAD_ROOT` monkeypatched to `tmp_path` for filesystem isolation). Confirmed via `main.app.openapi()['paths']` that all four routes (`/ask`, `/ingest`, `/ingest/{event_id}/status`, `/api/inngest`) register correctly.
 - **Could not verify live:** neither a local Inngest Dev Server (`127.0.0.1:8288`) nor Qdrant (`localhost:6333`) was reachable this session — same class of gap as Sessions 4 and 8. The status endpoint's run-object field assumption (D8) specifically needs a live check before this is demo-ready; flagged in §24, not silently assumed correct.
 - **Next:** `feature/api-tests` (broader endpoint test coverage, resolves F6) is the last item in §19's branch stack — or a live smoke test of all three endpoints against a running Inngest Dev Server + Qdrant + real Gemini key first, to close out the verification gaps from Sessions 4/8/9 in one pass. User's call.
+
+### Session 11 — 2026-08-17
+- Branched `feature/api-tests` off `feature/ingest-endpoint` — the last planned branch in §19's stack, closing out finding F6.
+- Reviewed existing coverage for all three endpoints and identified genuine gaps rather than re-testing what already existed: `/ask`'s `score_threshold` bounds and its unhandled-error → `500` path; `/ingest`'s multi-file-in-one-request case, a missing-filename rejection, and an `inngest_client.send` failure → `500` path; and a cross-endpoint concern no single-endpoint test covered — that the pieces actually compose together end-to-end, not just that the router calls the right mocked function.
+- Added the edge-case tests to `tests/test_ask_endpoint.py` (2 new) and `tests/test_ingest_endpoint.py` (3 new) — all passed immediately against the existing implementation, confirming correctness rather than fixing a bug.
+- Added `tests/test_full_flow.py` (2 new): exercises `/ask`'s real call chain (`routers.ask` → `rag_service.answer_question` → `search_context`/`build_prompt`/`generate_answer`/`parse_cited_answer`) with only the genuine external boundaries mocked (`vector_db.AsyncQdrantClient`, `data_loader.client.aio.models`) — unlike every other `/ask` test, which stubs `rag_service.answer_question` itself and so never proves the internal pieces wire together correctly. Covers both a normal grounded answer and F8's empty-context short-circuit.
+- Noted but did not attempt: testing `rag_ingest_pdf`/`rag_query_pdf_ai` (the Inngest function bodies themselves, as opposed to the `rag_service` functions they call) end-to-end would need Inngest's own test harness or a live Dev Server — out of scope for this project's unit-test suite, consistent with how Inngest-orchestrated code has been verified live rather than unit-tested throughout this project.
+- **Tests run:** `uv run pytest -q` → 49/49 passed (up from 42). Also ran with `-W error::RuntimeWarning` to confirm no unawaited-coroutine warnings.
+- **Next:** the branch stack planned in §19 is complete. Natural next steps: Step 7 (create the GitHub remote/repo, per Decision D2) now that Steps 1–6 are done, or a deliberate root-cause investigation of the transient `/ask` `500`/hang observed in Session 10 if it recurs (see §24). User's call.
 
 ## 23. Before/After Architecture
 
