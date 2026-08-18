@@ -105,7 +105,7 @@ def render_citation_chips(sources: list[str]) -> None:
     st.markdown(f'<div class="citation-chip-row">{chips}</div>', unsafe_allow_html=True)
 
 
-ask_tab, upload_tab = st.tabs(["Ask a Question", "Upload PDFs"])
+ask_tab, upload_tab, dashboard_tab = st.tabs(["Ask a Question", "Upload PDFs", "Dashboard"])
 
 with ask_tab:
     question = st.text_input("Question")
@@ -159,6 +159,11 @@ with upload_tab:
                         break
                     time.sleep(1.5)
             st.session_state["ingest_status"] = status
+            if status is not None and status.status == "Completed":
+                try:
+                    st.session_state["ingest_trace"] = api_client.get_trace(event_id)
+                except api_client.ApiError:
+                    st.session_state["ingest_trace"] = None
 
         if status is not None:
             if status.status == "Completed":
@@ -173,3 +178,29 @@ with upload_tab:
                 if st.button("Check again", key="check_again_button"):
                     st.session_state["ingest_poll_requested"] = True
                     st.rerun()
+
+
+def _format_duration(ms: int | None) -> str:
+    if ms is None:
+        return "—"
+    if ms < 1000:
+        return f"{ms} ms"
+    return f"{ms / 1000:.2f} s"
+
+
+with dashboard_tab:
+    st.subheader("Document Processing")
+    trace = st.session_state.get("ingest_trace")
+    if trace is not None:
+        st.metric("Total time", _format_duration(trace.total_duration_ms))
+        for step in trace.steps:
+            st.write(f"**{step.label}:** {_format_duration(step.duration_ms)}")
+    else:
+        st.write("Upload a PDF to see processing stats here.")
+
+    st.subheader("Answering")
+    last_ask_duration = st.session_state.get("last_ask_duration")
+    if last_ask_duration is not None:
+        st.metric("Last answer", f"{last_ask_duration:.2f} s")
+    else:
+        st.write("Ask a question to see timing here.")
