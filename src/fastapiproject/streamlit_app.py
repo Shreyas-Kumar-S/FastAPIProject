@@ -115,11 +115,13 @@ with ask_tab:
         score_threshold = st.slider("Score threshold", 0.0, 1.0, value=0.5, step=0.05)
 
     if st.button("Ask", key="ask_button") and question:
+        start_time = time.perf_counter()
         try:
             result = api_client.ask(question, top_k=top_k, score_threshold=score_threshold)
         except api_client.ApiError as exc:
             st.error(exc.detail)
         else:
+            st.session_state["last_ask_duration"] = time.perf_counter() - start_time
             st.write(result.answers)
             render_citation_chips(result.sources)
 
