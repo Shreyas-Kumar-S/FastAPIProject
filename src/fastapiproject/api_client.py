@@ -3,7 +3,12 @@ import os
 import httpx
 from dotenv import load_dotenv
 
-from fastapiproject.custom_types import IngestResponse, IngestStatusResponse, QueryResult
+from fastapiproject.custom_types import (
+    IngestResponse,
+    IngestStatusResponse,
+    IngestTraceResponse,
+    QueryResult,
+)
 
 load_dotenv()
 
@@ -56,3 +61,8 @@ def ingest(files: list[tuple[str, bytes]]) -> IngestResponse:
 def check_status(event_id: str) -> IngestStatusResponse:
     response = _request("GET", f"/ingest/{event_id}/status")
     return IngestStatusResponse(**response.json())
+
+
+def get_trace(event_id: str) -> IngestTraceResponse:
+    response = _request("GET", f"/ingest/{event_id}/trace")
+    return IngestTraceResponse(**response.json())

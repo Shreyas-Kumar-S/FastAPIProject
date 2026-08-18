@@ -4,7 +4,13 @@ import httpx
 import pytest
 
 from fastapiproject import api_client
-from fastapiproject.custom_types import IngestResponse, IngestStatusResponse, QueryResult
+from fastapiproject.custom_types import (
+    IngestResponse,
+    IngestStatusResponse,
+    IngestTraceResponse,
+    QueryResult,
+    TraceStep,
+)
 
 
 def _fake_response(status_code, json_body):
@@ -87,6 +93,32 @@ def test_check_status_returns_parsed_status():
     mock_request.assert_called_once_with(
         "GET",
         f"{api_client.BACKEND_URL}/ingest/evt_1/status",
+        timeout=120,
+        follow_redirects=True,
+    )
+
+
+def test_get_trace_returns_parsed_trace():
+    fake = _fake_response(
+        200,
+        {
+            "event_id": "evt_1",
+            "total_duration_ms": 1060,
+            "steps": [{"label": "Reading & splitting the document", "duration_ms": 13}],
+        },
+    )
+
+    with patch("httpx.request", return_value=fake) as mock_request:
+        result = api_client.get_trace("evt_1")
+
+    assert result == IngestTraceResponse(
+        event_id="evt_1",
+        total_duration_ms=1060,
+        steps=[TraceStep(label="Reading & splitting the document", duration_ms=13)],
+    )
+    mock_request.assert_called_once_with(
+        "GET",
+        f"{api_client.BACKEND_URL}/ingest/evt_1/trace",
         timeout=120,
         follow_redirects=True,
     )
