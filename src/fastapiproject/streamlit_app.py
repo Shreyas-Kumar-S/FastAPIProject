@@ -137,6 +137,7 @@ with upload_tab:
         else:
             st.session_state["ingest_event_id"] = ingest_result.event_id
             st.session_state["ingest_status"] = None
+            st.session_state["ingest_trace"] = None
             st.session_state["ingest_poll_requested"] = True
 
     event_id = st.session_state.get("ingest_event_id")

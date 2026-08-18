@@ -167,7 +167,7 @@ async def ingest_trace(event_id: str) -> IngestTraceResponse:
     if trace_response.status_code >= 400:
         raise HTTPException(status_code=502, detail="Inngest API returned an error")
 
-    trace_data = trace_response.json().get("data", {}).get("runTrace")
+    trace_data = (trace_response.json().get("data") or {}).get("runTrace")
     if not trace_data:
         return IngestTraceResponse(event_id=event_id, total_duration_ms=None, steps=[])
 

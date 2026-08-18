@@ -266,3 +266,22 @@ def test_trace_maps_upstream_error_to_502(client):
         response = client.get("/ingest/evt_1/trace")
 
     assert response.status_code == 502
+
+
+def test_trace_maps_graphql_connection_failure_to_503(client):
+    runs_response = httpx.Response(200, json={"data": [{"run_id": "run_1"}]})
+    with patch("httpx.AsyncClient.get", AsyncMock(return_value=runs_response)), \
+         patch("httpx.AsyncClient.post", AsyncMock(side_effect=httpx.ConnectError("nope"))):
+        response = client.get("/ingest/evt_1/trace")
+
+    assert response.status_code == 503
+
+
+def test_trace_maps_graphql_upstream_error_to_502(client):
+    runs_response = httpx.Response(200, json={"data": [{"run_id": "run_1"}]})
+    gql_error_response = httpx.Response(500, json={})
+    with patch("httpx.AsyncClient.get", AsyncMock(return_value=runs_response)), \
+         patch("httpx.AsyncClient.post", AsyncMock(return_value=gql_error_response)):
+        response = client.get("/ingest/evt_1/trace")
+
+    assert response.status_code == 502
