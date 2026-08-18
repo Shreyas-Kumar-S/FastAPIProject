@@ -85,6 +85,12 @@ async def ingest_status(event_id: str) -> IngestStatusResponse:
     error = None
     if status == "Completed":
         ingested = (run.get("output") or {}).get("ingested")
+        if ingested is None:
+            # Inngest's Dev Server can serve a cached run snapshot taken before
+            # the output field was attached (its own ~15-20s response cache) -
+            # a run genuinely isn't done until its output is actually present,
+            # so report it as still running rather than a bogus empty success.
+            status = "Running"
     elif status == "Failed":
         error = run.get("error")
 

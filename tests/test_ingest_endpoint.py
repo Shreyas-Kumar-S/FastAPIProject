@@ -121,6 +121,19 @@ def test_status_returns_completed_with_ingested_count(client):
     assert body["ingested"] == 5
 
 
+def test_status_reports_running_when_completed_but_output_not_yet_attached(client):
+    # Inngest's Dev Server can briefly cache a "Completed" run snapshot taken
+    # before the output field was attached (~15-20s server-side cache);
+    # every request in that window gets status=Completed with no output.
+    fake_response = httpx.Response(200, json={"data": [{"status": "Completed"}]})
+    with patch("httpx.AsyncClient.get", AsyncMock(return_value=fake_response)):
+        response = client.get("/ingest/evt_1/status")
+
+    body = response.json()
+    assert body["status"] == "Running"
+    assert body["ingested"] is None
+
+
 def test_status_returns_failed_with_error(client):
     fake_response = httpx.Response(200, json={"data": [{"status": "Failed", "error": "boom"}]})
     with patch("httpx.AsyncClient.get", AsyncMock(return_value=fake_response)):

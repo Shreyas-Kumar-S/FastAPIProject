@@ -162,7 +162,10 @@ with upload_tab:
 
         if status is not None:
             if status.status == "Completed":
-                st.success(f"Ingested {status.ingested} chunks.")
+                if status.ingested is not None:
+                    st.success(f"Ingested {status.ingested} chunks.")
+                else:
+                    st.success("Upload complete.")
             elif status.status == "Failed":
                 st.error(status.error or "Ingestion failed (no details returned).")
             else:
