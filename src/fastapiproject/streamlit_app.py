@@ -101,7 +101,7 @@ st.title("RAG PDF Assistant")
 def render_citation_chips(sources: list[str]) -> None:
     if not sources:
         return
-    chips = "".join(f'<span class="citation-chip">{html.escape(s)}</span>' for s in sources)
+    chips = "".join(f'<span class="citation-chip">Source: {html.escape(s)}</span>' for s in sources)
     st.markdown(f'<div class="citation-chip-row">{chips}</div>', unsafe_allow_html=True)
 
 
