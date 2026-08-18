@@ -35,3 +35,12 @@ class IngestStatusResponse(pydantic.BaseModel):
     ingested: int | None = None
     error: str | None = None
 
+class TraceStep(pydantic.BaseModel):
+    label: str
+    duration_ms: int | None = None
+
+class IngestTraceResponse(pydantic.BaseModel):
+    event_id: str
+    total_duration_ms: int | None = None
+    steps: list[TraceStep] = []
+

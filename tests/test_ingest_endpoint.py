@@ -157,3 +157,112 @@ def test_status_maps_upstream_error_to_502(client):
         response = client.get("/ingest/evt_1/status")
 
     assert response.status_code == 502
+
+
+def test_trace_returns_empty_when_no_runs_yet(client):
+    fake_response = httpx.Response(200, json={"data": []})
+    with patch("httpx.AsyncClient.get", AsyncMock(return_value=fake_response)):
+        response = client.get("/ingest/evt_1/trace")
+
+    assert response.status_code == 200
+    assert response.json() == {"event_id": "evt_1", "total_duration_ms": None, "steps": []}
+
+
+def test_trace_returns_deduped_relabeled_steps(client):
+    runs_response = httpx.Response(200, json={"data": [{"run_id": "run_1"}]})
+    gql_response = httpx.Response(
+        200,
+        json={
+            "data": {
+                "runTrace": {
+                    "duration": 1060,
+                    "childrenSpans": [
+                        {
+                            "name": "Load and Chunk pdf",
+                            "duration": None,
+                            "startedAt": "2026-08-18T05:00:10.025Z",
+                            "endedAt": "2026-08-18T05:00:10.035Z",
+                        },
+                        {
+                            "name": "Load and Chunk pdf",
+                            "duration": 13,
+                            "startedAt": "2026-08-18T05:00:10.024Z",
+                            "endedAt": "2026-08-18T05:00:10.037Z",
+                        },
+                        {
+                            "name": "Embedding and upsert",
+                            "duration": 788,
+                            "startedAt": "2026-08-18T05:00:10.173Z",
+                            "endedAt": "2026-08-18T05:00:10.961Z",
+                        },
+                        {
+                            "name": "Finalization",
+                            "duration": None,
+                            "startedAt": "2026-08-18T05:00:11.077Z",
+                            "endedAt": "2026-08-18T05:00:11.082Z",
+                        },
+                        {
+                            "name": "executor.nonstep",
+                            "duration": 10,
+                            "startedAt": "2026-08-18T05:00:10.962Z",
+                            "endedAt": "2026-08-18T05:00:11.084Z",
+                        },
+                    ],
+                }
+            }
+        },
+    )
+    with patch("httpx.AsyncClient.get", AsyncMock(return_value=runs_response)), \
+         patch("httpx.AsyncClient.post", AsyncMock(return_value=gql_response)):
+        response = client.get("/ingest/evt_1/trace")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total_duration_ms"] == 1060
+    assert body["steps"] == [
+        {"label": "Reading & splitting the document", "duration_ms": 13},
+        {"label": "Generating embeddings & saving to the index", "duration_ms": 788},
+        {"label": "Finishing up", "duration_ms": 5},
+    ]
+
+
+def test_trace_falls_back_to_raw_name_for_unmapped_step(client):
+    runs_response = httpx.Response(200, json={"data": [{"run_id": "run_1"}]})
+    gql_response = httpx.Response(
+        200,
+        json={
+            "data": {
+                "runTrace": {
+                    "duration": 42,
+                    "childrenSpans": [
+                        {
+                            "name": "Some Future Step",
+                            "duration": 7,
+                            "startedAt": "2026-08-18T05:00:10.000Z",
+                            "endedAt": "2026-08-18T05:00:10.007Z",
+                        },
+                    ],
+                }
+            }
+        },
+    )
+    with patch("httpx.AsyncClient.get", AsyncMock(return_value=runs_response)), \
+         patch("httpx.AsyncClient.post", AsyncMock(return_value=gql_response)):
+        response = client.get("/ingest/evt_1/trace")
+
+    assert response.json()["steps"] == [{"label": "Some Future Step", "duration_ms": 7}]
+
+
+def test_trace_maps_connection_failure_to_503(client):
+    with patch("httpx.AsyncClient.get", AsyncMock(side_effect=httpx.ConnectError("nope"))):
+        response = client.get("/ingest/evt_1/trace")
+
+    assert response.status_code == 503
+
+
+def test_trace_maps_upstream_error_to_502(client):
+    fake_response = httpx.Response(500, json={})
+    with patch("httpx.AsyncClient.get", AsyncMock(return_value=fake_response)):
+        response = client.get("/ingest/evt_1/trace")
+
+    assert response.status_code == 502

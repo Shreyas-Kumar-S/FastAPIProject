@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 import httpx
@@ -7,13 +8,39 @@ from fastapi import APIRouter, File, HTTPException, UploadFile
 from qdrant_client.http.exceptions import ApiException as QdrantApiException
 
 from fastapiproject import data_loader, rag_service
-from fastapiproject.custom_types import AskRequest, IngestResponse, IngestStatusResponse, QueryResult
+from fastapiproject.custom_types import (
+    AskRequest,
+    IngestResponse,
+    IngestStatusResponse,
+    IngestTraceResponse,
+    QueryResult,
+    TraceStep,
+)
 from fastapiproject.inngest_client import client as inngest_client
 
 ask_router = APIRouter()
 ingest_router = APIRouter()
 
 MAX_PDF_SIZE_BYTES = 20 * 1024 * 1024
+
+STEP_LABELS = {
+    "Load and Chunk pdf": "Reading & splitting the document",
+    "Embedding and upsert": "Generating embeddings & saving to the index",
+    "Finalization": "Finishing up",
+}
+
+
+def _span_duration_ms(span: dict) -> int | None:
+    duration = span.get("duration")
+    if duration is not None:
+        return duration
+    started = span.get("startedAt")
+    ended = span.get("endedAt")
+    if started and ended:
+        start_dt = datetime.fromisoformat(started.replace("Z", "+00:00"))
+        end_dt = datetime.fromisoformat(ended.replace("Z", "+00:00"))
+        return int((end_dt - start_dt).total_seconds() * 1000)
+    return None
 
 
 def upload_dir() -> Path:
@@ -95,3 +122,76 @@ async def ingest_status(event_id: str) -> IngestStatusResponse:
         error = run.get("error")
 
     return IngestStatusResponse(event_id=event_id, status=status, ingested=ingested, error=error)
+
+
+@ingest_router.get("/ingest/{event_id}/trace", response_model=IngestTraceResponse)
+async def ingest_trace(event_id: str) -> IngestTraceResponse:
+    runs_url = f"{inngest_client.api_origin}v1/events/{event_id}/runs"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            runs_response = await client.get(runs_url)
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=503, detail="Inngest API is unreachable") from exc
+
+    if runs_response.status_code >= 400:
+        raise HTTPException(status_code=502, detail="Inngest API returned an error")
+
+    runs = runs_response.json().get("data", [])
+    if not runs:
+        return IngestTraceResponse(event_id=event_id, total_duration_ms=None, steps=[])
+
+    run_id = runs[0].get("run_id")
+    if not run_id:
+        return IngestTraceResponse(event_id=event_id, total_duration_ms=None, steps=[])
+
+    gql_url = f"{inngest_client.api_origin}v0/gql"
+    query = """
+        query($runID: String!) {
+          runTrace(runID: $runID) {
+            duration
+            childrenSpans {
+              name
+              duration
+              startedAt
+              endedAt
+            }
+          }
+        }
+    """
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            trace_response = await client.post(gql_url, json={"query": query, "variables": {"runID": run_id}})
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=503, detail="Inngest API is unreachable") from exc
+
+    if trace_response.status_code >= 400:
+        raise HTTPException(status_code=502, detail="Inngest API returned an error")
+
+    trace_data = trace_response.json().get("data", {}).get("runTrace")
+    if not trace_data:
+        return IngestTraceResponse(event_id=event_id, total_duration_ms=None, steps=[])
+
+    raw_durations_by_name: dict[str, int | None] = {}
+    fallback_span_by_name: dict[str, dict] = {}
+    order: list[str] = []
+    for span in trace_data.get("childrenSpans", []):
+        name = span.get("name", "")
+        if not name or name.startswith("executor."):
+            continue
+        raw_duration = span.get("duration")
+        if name not in raw_durations_by_name:
+            order.append(name)
+            raw_durations_by_name[name] = raw_duration
+            fallback_span_by_name[name] = span
+        elif raw_durations_by_name[name] is None and raw_duration is not None:
+            raw_durations_by_name[name] = raw_duration
+            fallback_span_by_name[name] = span
+
+    steps = []
+    for name in order:
+        duration = raw_durations_by_name[name]
+        if duration is None:
+            duration = _span_duration_ms(fallback_span_by_name[name])
+        steps.append(TraceStep(label=STEP_LABELS.get(name, name), duration_ms=duration))
+
+    return IngestTraceResponse(event_id=event_id, total_duration_ms=trace_data.get("duration"), steps=steps)
