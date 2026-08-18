@@ -2,6 +2,7 @@ from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
+from google.genai import errors as genai_errors
 from qdrant_client.http.exceptions import ResponseHandlingException
 
 from fastapiproject import main, rag_service
@@ -58,6 +59,24 @@ def test_ask_rejects_score_threshold_out_of_bounds(client):
     response = client.post("/ask", json={"question": "q", "score_threshold": 1.5})
 
     assert response.status_code == 422
+
+
+def test_ask_maps_gemini_server_error_to_503(client):
+    error = genai_errors.ServerError(503, {"error": {"message": "This model is currently experiencing high demand."}})
+    with patch.object(rag_service, "answer_question", side_effect=error):
+        response = client.post("/ask", json={"question": "q"})
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "AI service is temporarily unavailable, please try again"}
+
+
+def test_ask_maps_gemini_client_error_to_503(client):
+    error = genai_errors.ClientError(429, {"error": {"message": "rate limited"}})
+    with patch.object(rag_service, "answer_question", side_effect=error):
+        response = client.post("/ask", json={"question": "q"})
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "AI service is temporarily unavailable, please try again"}
 
 
 def test_ask_returns_500_on_unexpected_error(monkeypatch):

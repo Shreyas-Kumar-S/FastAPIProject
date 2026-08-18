@@ -5,6 +5,7 @@ from pathlib import Path
 import httpx
 import inngest
 from fastapi import APIRouter, File, HTTPException, UploadFile
+from google.genai import errors as genai_errors
 from qdrant_client.http.exceptions import ApiException as QdrantApiException
 
 from fastapiproject import data_loader, rag_service
@@ -57,6 +58,8 @@ async def ask(request: AskRequest) -> QueryResult:
         return await rag_service.answer_question(request.question, request.top_k, request.score_threshold)
     except QdrantApiException as exc:
         raise HTTPException(status_code=503, detail="Vector store is unreachable") from exc
+    except genai_errors.APIError as exc:
+        raise HTTPException(status_code=503, detail="AI service is temporarily unavailable, please try again") from exc
 
 
 @ingest_router.post("/ingest", response_model=IngestResponse, status_code=202)
