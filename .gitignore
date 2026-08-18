@@ -21,3 +21,6 @@ uploads/
 
 # Isolated worktrees for subagent-driven-development plans
 .worktrees/
+
+# Ad hoc Streamlit boot-check logs from task verification
+*.log
